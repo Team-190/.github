@@ -1,0 +1,50 @@
+name: Sync Onshape Delta BOM to Baserow
+
+on:
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [bom_sync_delta_baserow]
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+concurrency:
+  group: onshape-baserow-delta
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pre-2027-onshape_ci/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r pre-2027-onshape_ci/requirements.txt
+
+      - name: Sync BOM to Baserow
+        env:
+          ONSHAPE_ACCESS_KEY: ${{ secrets.ONSHAPE_ACCESS_KEY }}
+          ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
+          ONSHAPE_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_DELTA }}
+          PARTNUMBER_PREFIXES: "P-190B-26"
+
+          BASEROW_API_URL: ${{ vars.BASEROW_API_URL || 'https://api.baserow.io/api' }}
+          BASEROW_TOKEN: ${{ secrets.BASEROW_TOKEN }}
+          BASEROW_SYNC_RUNS_TABLE_ID: "1119639"
+          BASEROW_PARTS_TABLE_ID: "1119641"
+          BASEROW_REQUIREMENTS_TABLE_ID: "1119642"
+          BASEROW_STORAGE_LOCATIONS_TABLE_ID: "1119643"
+          BASEROW_ASSEMBLIES_TABLE_ID: "1119645"
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python pre-2027-onshape_ci/OnshapeToBaserow.py

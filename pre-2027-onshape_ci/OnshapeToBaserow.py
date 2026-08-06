@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Synchronize an Onshape multilevel BOM into Baserow.
+
+Engineering-owned fields are updated on every run. Manufacturing status, machine,
+machinist, finishing, location, QC, and disposition are intentionally untouched.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import requests
+
+
+ASSEMBLY_NAME_RE = re.compile(r"^A-[A-Za-z0-9-]+$")
+BATCH_SIZE = 100
+
+
+@dataclass(frozen=True)
+class OnshapeTarget:
+    base_url: str
+    did: str
+    wvm_type: str
+    wvm_id: str
+    eid: str
+
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_onshape_doc_url(doc_url: str) -> OnshapeTarget:
+    parsed = urlparse(doc_url.strip())
+    match = re.search(
+        r"/documents/([a-fA-F0-9]+)/([wvm])/([a-fA-F0-9]+)/e/([a-fA-F0-9]+)",
+        parsed.path,
+    )
+    if not parsed.scheme or not parsed.netloc or not match:
+        raise ValueError("ONSHAPE_DOC_URL must be a full Onshape assembly-tab URL")
+    did, wvm_type, wvm_id, eid = match.groups()
+    return OnshapeTarget(
+        base_url=f"{parsed.scheme}://{parsed.netloc}",
+        did=did,
+        wvm_type=wvm_type,
+        wvm_id=wvm_id,
+        eid=eid,
+    )
+
+
+def onshape_headers(method: str, full_url: str) -> dict[str, str]:
+    parsed = urlparse(full_url)
+    date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    nonce = os.urandom(16).hex()
+    content_type = "application/json"
+    string_to_sign = (
+        f"{method}\n{nonce}\n{date}\n{content_type}\n"
+        f"{parsed.path}\n{parsed.query or ''}\n"
+    ).lower()
+    signature = hmac.new(
+        require_env("ONSHAPE_SECRET_KEY").encode(),
+        string_to_sign.encode(),
+        hashlib.sha256,
+    ).digest()
+    encoded = base64.b64encode(signature).decode()
+    return {
+        "Authorization": f"On {require_env('ONSHAPE_ACCESS_KEY')}:HmacSHA256:{encoded}",
+        "Date": date,
+        "On-Nonce": nonce,
+        "Content-Type": content_type,
+        "Accept": "application/json",
+    }
+
+
+def fetch_bom(target: OnshapeTarget) -> list[dict]:
+    endpoint = (
+        f"{target.base_url}/api/assemblies/d/{target.did}/"
+        f"{target.wvm_type}/{target.wvm_id}/e/{target.eid}/bom"
+    )
+    params = {
+        "indented": "true",
+        "multiLevel": "true",
+        "generateIfAbsent": "false",
+        "includeItemMicroversions": "false",
+        "includeTopLevelAssemblyRow": "false",
+        "thumbnail": "false",
+    }
+    url = f"{endpoint}?{urlencode(params)}"
+    response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload.get("bomTable"), dict):
+        items = payload["bomTable"].get("items")
+        if isinstance(items, list):
+            return items
+    for key in ("items", "rows", "bomItems", "bomRows"):
+        if isinstance(payload.get(key), list):
+            return payload[key]
+    raise RuntimeError("Unexpected Onshape BOM response: no items array")
+
+
+def indent_level(row: dict) -> int:
+    source = row.get("itemSource")
+    if not isinstance(source, dict):
+        return 0
+    try:
+        return int(source.get("indentLevel", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_assembly_row(row: dict) -> bool:
+    name = str(row.get("name") or "").strip()
+    part_number = str(row.get("partNumber") or "").strip()
+    return bool(ASSEMBLY_NAME_RE.match(name)) and part_number.upper() in ("", "N/A")
+
+
+def annotate_assemblies(items: list[dict]) -> list[dict]:
+    output = []
+    stack: list[tuple[int, str]] = []
+    for original in items:
+        row = dict(original)
+        level = indent_level(row)
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        if is_assembly_row(row):
+            stack.append((level, str(row.get("name") or "").strip()))
+        row["assemblyNumber"] = stack[-1][1] if stack else ""
+        output.append(row)
+    return output
+
+
+def material_name(value) -> str:
+    if isinstance(value, dict):
+        return str(value.get("displayName") or value.get("id") or "").strip()
+    return str(value or "").strip()
+
+
+def source_url_and_configuration(value) -> tuple[str, str]:
+    if isinstance(value, dict):
+        url = str(value.get("viewHref") or "").strip()
+    else:
+        url = str(value or "").strip()
+    configuration = parse_qs(urlparse(url).query).get("configuration", ["default"])[0]
+    return url, configuration or "default"
+
+
+def decimal_quantity(value) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except InvalidOperation as exc:
+        raise ValueError(f"Invalid BOM quantity: {value!r}") from exc
+
+
+def number_value(value: Decimal):
+    return int(value) if value == value.to_integral_value() else float(value)
+
+
+def build_records(items: list[dict], prefixes: list[str]):
+    parts: dict[str, dict] = {}
+    requirements: dict[str, dict] = {}
+    warnings: list[str] = []
+
+    for row in annotate_assemblies(items):
+        part_number = str(row.get("partNumber") or "").strip()
+        if not part_number or (prefixes and not any(part_number.startswith(p) for p in prefixes)):
+            continue
+
+        assembly_number = str(row.get("assemblyNumber") or "").strip()
+        source_url, configuration = source_url_and_configuration(row.get("itemSource"))
+        part = {
+            "Part Number": part_number,
+            "Name": str(row.get("name") or "").strip(),
+            "Description": str(row.get("description") or "").strip(),
+            "Material": material_name(row.get("material")),
+            "Manufacturing Method": str(row.get("manufacturingmethod") or "").strip(),
+            "Vendor": str(row.get("vendor") or "").strip(),
+            "Revision": str(row.get("revision") or "").strip(),
+            "Onshape State": str(row.get("state") or "").strip(),
+            "Category": str(row.get("category") or "").strip(),
+            "Active": True,
+        }
+        previous = parts.get(part_number)
+        if previous and any(previous.get(k) != part.get(k) for k in ("Name", "Material", "Manufacturing Method")):
+            warnings.append(f"Conflicting engineering properties for {part_number}")
+        else:
+            parts[part_number] = part
+
+        key = f"{assembly_number}|{part_number}|{configuration}"
+        requirement = requirements.setdefault(
+            key,
+            {
+                "Production Key": key,
+                "part_number": part_number,
+                "assembly_number": assembly_number,
+                "Configuration": configuration,
+                "Required Quantity": Decimal("0"),
+                "positions": [],
+                "Onshape Source": source_url,
+                "Active in BOM": True,
+            },
+        )
+        requirement["Required Quantity"] += decimal_quantity(row.get("quantity"))
+        position = str(row.get("item") or "").strip()
+        if position and position not in requirement["positions"]:
+            requirement["positions"].append(position)
+
+    for requirement in requirements.values():
+        requirement["Required Quantity"] = number_value(requirement["Required Quantity"])
+        requirement["BOM Positions"] = ", ".join(requirement.pop("positions"))
+    return list(parts.values()), list(requirements.values()), sorted(set(warnings))
+
+
+class BaserowClient:
+    def __init__(self, base_url: str, token: str):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": f"Token {token}", "Content-Type": "application/json"})
+
+    def _url(self, table_id: int, suffix: str = "") -> str:
+        return f"{self.base_url}/database/rows/table/{table_id}/{suffix}?user_field_names=true"
+
+    def list_rows(self, table_id: int) -> list[dict]:
+        rows = []
+        page = 1
+        while True:
+            response = self.session.get(self._url(table_id), params={"user_field_names": "true", "page": page, "size": 200}, timeout=60)
+            response.raise_for_status()
+            payload = response.json()
+            rows.extend(payload.get("results", []))
+            if not payload.get("next"):
+                return rows
+            page += 1
+
+    def create_one(self, table_id: int, fields: dict) -> dict:
+        response = self.session.post(self._url(table_id), json=fields, timeout=60)
+        response.raise_for_status()
+        return response.json()
+
+    def update_one(self, table_id: int, row_id: int, fields: dict) -> dict:
+        response = self.session.patch(self._url(table_id, str(row_id) + "/"), json=fields, timeout=60)
+        response.raise_for_status()
+        return response.json()
+
+    def batch_create(self, table_id: int, items: list[dict]) -> list[dict]:
+        created = []
+        for start in range(0, len(items), BATCH_SIZE):
+            response = self.session.post(self._url(table_id, "batch/"), json={"items": items[start:start+BATCH_SIZE]}, timeout=60)
+            response.raise_for_status()
+            created.extend(response.json().get("items", []))
+        return created
+
+    def batch_update(self, table_id: int, items: list[dict]) -> list[dict]:
+        updated = []
+        for start in range(0, len(items), BATCH_SIZE):
+            response = self.session.patch(self._url(table_id, "batch/"), json={"items": items[start:start+BATCH_SIZE]}, timeout=60)
+            response.raise_for_status()
+            updated.extend(response.json().get("items", []))
+        return updated
+
+
+def comparable(value):
+    if isinstance(value, list):
+        return sorted(x.get("id", x) if isinstance(x, dict) else x for x in value)
+    return value if value is not None else ""
+
+
+def changed(existing: dict, desired: dict, fields: tuple[str, ...]) -> bool:
+    return any(comparable(existing.get(field)) != comparable(desired.get(field)) for field in fields)
+
+
+def upsert_table(
+    client: BaserowClient,
+    table_id: int,
+    key_field: str,
+    desired: list[dict],
+    update_fields: tuple[str, ...],
+    change_flag_field: str | None = None,
+):
+    existing = client.list_rows(table_id)
+    by_key = {str(row.get(key_field) or ""): row for row in existing}
+    creates, updates = [], []
+    for fields in desired:
+        current = by_key.get(str(fields[key_field]))
+        if current is None:
+            creates.append({**fields, **({change_flag_field: False} if change_flag_field else {})})
+        elif changed(current, fields, update_fields):
+            updates.append({"id": current["id"], **fields, **({change_flag_field: True} if change_flag_field else {})})
+    created = client.batch_create(table_id, creates) if creates else []
+    updated = client.batch_update(table_id, updates) if updates else []
+    return len(created), len(updated), len(desired) - len(creates) - len(updates)
+
+
+def sync_to_baserow(parts: list[dict], requirements: list[dict], warnings: list[str], source_rows: int) -> dict:
+    client = BaserowClient(require_env("BASEROW_API_URL"), require_env("BASEROW_TOKEN"))
+    table_ids = {
+        "sync": int(require_env("BASEROW_SYNC_RUNS_TABLE_ID")),
+        "parts": int(require_env("BASEROW_PARTS_TABLE_ID")),
+        "requirements": int(require_env("BASEROW_REQUIREMENTS_TABLE_ID")),
+        "assemblies": int(require_env("BASEROW_ASSEMBLIES_TABLE_ID")),
+    }
+    started = utc_now()
+    run = client.create_one(table_ids["sync"], {"Started At": started, "Result": "Running", "Source Rows": source_rows})
+    try:
+        now = utc_now()
+        assemblies = [{"Assembly Number": n, "Active": True} for n in sorted({r["assembly_number"] for r in requirements if r["assembly_number"]})]
+        assembly_fields = ("Assembly Number", "Active")
+        upsert_table(client, table_ids["assemblies"], "Assembly Number", assemblies, assembly_fields)
+        assembly_rows = client.list_rows(table_ids["assemblies"])
+        assembly_ids = {str(r.get("Assembly Number") or ""): r["id"] for r in assembly_rows}
+
+        for part in parts:
+            part["Last Synced At"] = now
+        part_fields = ("Name", "Description", "Material", "Manufacturing Method", "Vendor", "Revision", "Onshape State", "Category", "Active")
+        upsert_table(client, table_ids["parts"], "Part Number", parts, part_fields)
+        part_rows = client.list_rows(table_ids["parts"])
+        part_ids = {str(r.get("Part Number") or ""): r["id"] for r in part_rows}
+
+        desired_requirements = []
+        for requirement in requirements:
+            fields = {k: v for k, v in requirement.items() if k not in ("part_number", "assembly_number")}
+            fields["Part"] = [part_ids[requirement["part_number"]]]
+            fields["Assembly"] = [assembly_ids[requirement["assembly_number"]]] if requirement["assembly_number"] else []
+            fields["Last Synced At"] = now
+            desired_requirements.append(fields)
+
+        source_fields = ("Part", "Assembly", "Configuration", "Required Quantity", "BOM Positions", "Onshape Source", "Active in BOM")
+        created, updated, unchanged = upsert_table(
+            client,
+            table_ids["requirements"],
+            "Production Key",
+            desired_requirements,
+            source_fields,
+            change_flag_field="Engineering Changed",
+        )
+
+        existing_requirements = client.list_rows(table_ids["requirements"])
+        active_assemblies = set(assembly_ids)
+        desired_keys = {r["Production Key"] for r in desired_requirements}
+        deactivate = []
+        for row in existing_requirements:
+            linked = row.get("Assembly") or []
+            assembly_names = {str(x.get("value") or "") for x in linked if isinstance(x, dict)}
+            if assembly_names & active_assemblies and row.get("Production Key") not in desired_keys and row.get("Active in BOM"):
+                deactivate.append({"id": row["id"], "Active in BOM": False, "Engineering Changed": True})
+        if deactivate:
+            client.batch_update(table_ids["requirements"], deactivate)
+
+        summary = {
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "deactivated": len(deactivate),
+        }
+        client.update_one(table_ids["sync"], run["id"], {
+            "Finished At": utc_now(),
+            "Result": "Partial" if warnings else "Success",
+            "Requirements Created": created,
+            "Requirements Updated": updated,
+            "Requirements Unchanged": unchanged,
+            "Requirements Deactivated": len(deactivate),
+            "Warnings": "\n".join(warnings),
+            "GitHub Run URL": os.environ.get("GITHUB_RUN_URL", ""),
+        })
+        return summary
+    except Exception as exc:
+        try:
+            client.update_one(table_ids["sync"], run["id"], {"Finished At": utc_now(), "Result": "Failed", "Error": str(exc)[:10000]})
+        finally:
+            raise
+
+
+def main() -> int:
+    target = parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))
+    prefixes = [p.strip() for p in os.environ.get("PARTNUMBER_PREFIXES", "").split(",") if p.strip()]
+    raw_items = fetch_bom(target)
+    parts, requirements, warnings = build_records(raw_items, prefixes)
+    print(f"Onshape rows={len(raw_items)} parts={len(parts)} production_requirements={len(requirements)}")
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+    summary = sync_to_baserow(parts, requirements, warnings, source_rows=len(raw_items))
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
