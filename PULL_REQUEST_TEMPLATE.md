@@ -22,7 +22,17 @@ https://team-190.github.io/190-Software-Knowledge-Base/software_engineering_prac
 <!-- e.g. Assisted-by: Claude Code:claude-opus-5 dataviz -->
 
 **Environmental impact estimate:**
-<!-- Rough, good-faith estimate of resource cost (electricity, CO2, water, API cost, etc.) using available public data. -->
+<!-- Rough, good-faith estimate of resource cost using available public data. See the policy page for how to derive each row. -->
+
+| Metric | Estimate | Context | Source |
+|--------|----------|---------|--------|
+| Session | | | |
+| Input tokens | | | |
+| Output tokens | | | |
+| Electricity | | | |
+| CO2e | | | |
+| Water (cooling) | | | |
+| API cost | | | |
 
 **Chat log:**
 <!-- Link to the full transcript of the AI session(s), or attach as docs/ai-logs/<pr-number>.md. -->
