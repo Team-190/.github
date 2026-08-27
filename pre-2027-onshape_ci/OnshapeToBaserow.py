@@ -7,6 +7,7 @@ machinist, finishing, location, QC, and disposition are intentionally untouched.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import hmac
@@ -16,13 +17,16 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from urllib.parse import parse_qs, urlencode, urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
 
 
 ASSEMBLY_NAME_RE = re.compile(r"^A-[A-Za-z0-9-]+$")
 BATCH_SIZE = 100
+ONSHAPE_API_VERSION = "v16"
+ASSEMBLY_ELEMENT_TYPE = 1
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,51 @@ class OnshapeTarget:
     wvm_type: str
     wvm_id: str
     eid: str
+    configuration: str = "default"
+
+
+@dataclass(frozen=True)
+class ReleasedAssembly:
+    document_id: str
+    element_id: str
+    version_id: str
+    revision: str
+    part_number: str
+    name: str
+    configuration: str
+    release_id: str
+    release_name: str
+    version_name: str
+    created_at: str
+    is_obsolete: bool
+    view_ref: str
+
+    def bom_target(self, base_url: str) -> OnshapeTarget:
+        return OnshapeTarget(
+            base_url=base_url,
+            did=self.document_id,
+            wvm_type="v",
+            wvm_id=self.version_id,
+            eid=self.element_id,
+            configuration=self.configuration,
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "document_id": self.document_id,
+            "element_id": self.element_id,
+            "version_id": self.version_id,
+            "revision": self.revision,
+            "part_number": self.part_number,
+            "name": self.name,
+            "configuration": self.configuration,
+            "release_id": self.release_id,
+            "release_name": self.release_name,
+            "version_name": self.version_name,
+            "created_at": self.created_at,
+            "is_obsolete": self.is_obsolete,
+            "view_ref": self.view_ref,
+        }
 
 
 def require_env(name: str) -> str:
@@ -54,12 +103,16 @@ def parse_onshape_doc_url(doc_url: str) -> OnshapeTarget:
     if not parsed.scheme or not parsed.netloc or not match:
         raise ValueError("ONSHAPE_DOC_URL must be a full Onshape assembly-tab URL")
     did, wvm_type, wvm_id, eid = match.groups()
+    configuration = parse_qs(parsed.query, keep_blank_values=True).get(
+        "configuration", ["default"]
+    )[0]
     return OnshapeTarget(
         base_url=f"{parsed.scheme}://{parsed.netloc}",
         did=did,
         wvm_type=wvm_type,
         wvm_id=wvm_id,
         eid=eid,
+        configuration=configuration or "default",
     )
 
 
@@ -87,9 +140,119 @@ def onshape_headers(method: str, full_url: str) -> dict[str, str]:
     }
 
 
+def onshape_get_json(url: str) -> dict:
+    response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected Onshape response from {url}: expected an object")
+    return payload
+
+
+def normalized_configuration(value) -> str:
+    configuration = str(value or "").strip()
+    return configuration if configuration and configuration.lower() != "default" else "default"
+
+
+def fetch_document_revisions(target: OnshapeTarget) -> list[dict]:
+    """Fetch every revision page for the document containing the tracked assembly."""
+    url = (
+        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/revisions/d/{target.did}"
+    )
+    expected_origin = urlparse(target.base_url)
+    revisions: list[dict] = []
+    seen_urls: set[str] = set()
+    while url:
+        if url in seen_urls:
+            raise RuntimeError("Onshape revision pagination returned a cycle")
+        seen_urls.add(url)
+        payload = onshape_get_json(url)
+        page_items = payload.get("items")
+        if not isinstance(page_items, list):
+            raise RuntimeError("Unexpected Onshape revisions response: no items array")
+        revisions.extend(item for item in page_items if isinstance(item, dict))
+
+        next_url = str(payload.get("next") or "").strip()
+        if not next_url:
+            break
+        url = urljoin(url, next_url)
+        parsed_next = urlparse(url)
+        if (
+            parsed_next.scheme != expected_origin.scheme
+            or parsed_next.netloc != expected_origin.netloc
+        ):
+            raise RuntimeError("Onshape revision pagination changed API origin")
+    return revisions
+
+
+def select_latest_released_assembly(
+    target: OnshapeTarget, revisions: list[dict]
+) -> ReleasedAssembly:
+    """Select the latest released revision for exactly the tracked assembly/config."""
+    target_configuration = normalized_configuration(target.configuration)
+    candidates = [
+        item
+        for item in revisions
+        if str(item.get("documentId") or "") == target.did
+        and str(item.get("elementId") or "") == target.eid
+        and item.get("elementType") == ASSEMBLY_ELEMENT_TYPE
+        and normalized_configuration(item.get("configuration"))
+        == target_configuration
+    ]
+    if not candidates:
+        raise RuntimeError(
+            "No released assembly revision found for the element/configuration in "
+            "ONSHAPE_DOC_URL"
+        )
+
+    # Onshape documents nextRevisionId as null on the latest revision. There can
+    # be more than one terminal history after part-number reuse, so timestamps
+    # provide the final ordering without assuming revision names are sortable.
+    latest_candidates = [item for item in candidates if not item.get("nextRevisionId")]
+    if not latest_candidates:
+        raise RuntimeError(
+            "Onshape returned no terminal revision for the tracked assembly; "
+            "refusing to guess a configuration baseline"
+        )
+    latest = max(
+        latest_candidates,
+        key=lambda item: (
+            str(item.get("releaseCreatedDate") or item.get("createdAt") or ""),
+            str(item.get("id") or ""),
+        ),
+    )
+    version_id = str(latest.get("versionId") or "").strip()
+    if not version_id:
+        raise RuntimeError("Latest released assembly revision has no immutable versionId")
+
+    return ReleasedAssembly(
+        document_id=str(latest.get("documentId") or target.did),
+        element_id=str(latest.get("elementId") or target.eid),
+        version_id=version_id,
+        revision=str(latest.get("revision") or "").strip(),
+        part_number=str(latest.get("partNumber") or "").strip(),
+        name=str(latest.get("name") or "").strip(),
+        configuration=normalized_configuration(latest.get("configuration")),
+        release_id=str(latest.get("releaseId") or "").strip(),
+        release_name=str(latest.get("releaseName") or "").strip(),
+        version_name=str(latest.get("versionName") or "").strip(),
+        created_at=str(
+            latest.get("releaseCreatedDate") or latest.get("createdAt") or ""
+        ).strip(),
+        is_obsolete=bool(latest.get("isObsolete")),
+        view_ref=str(latest.get("viewRef") or "").strip(),
+    )
+
+
+def resolve_latest_released_assembly(target: OnshapeTarget) -> ReleasedAssembly:
+    if target.wvm_type != "w":
+        raise ValueError("ONSHAPE_DOC_URL must point to the assembly in a workspace (Main)")
+    return select_latest_released_assembly(target, fetch_document_revisions(target))
+
+
 def fetch_bom(target: OnshapeTarget) -> list[dict]:
     endpoint = (
-        f"{target.base_url}/api/assemblies/d/{target.did}/"
+        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/assemblies/d/{target.did}/"
         f"{target.wvm_type}/{target.wvm_id}/e/{target.eid}/bom"
     )
     params = {
@@ -99,11 +262,10 @@ def fetch_bom(target: OnshapeTarget) -> list[dict]:
         "includeItemMicroversions": "false",
         "includeTopLevelAssemblyRow": "false",
         "thumbnail": "false",
+        "configuration": target.configuration,
     }
     url = f"{endpoint}?{urlencode(params)}"
-    response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
-    response.raise_for_status()
-    payload = response.json()
+    payload = onshape_get_json(url)
     if isinstance(payload.get("bomTable"), dict):
         items = payload["bomTable"].get("items")
         if isinstance(items, list):
@@ -385,16 +547,94 @@ def sync_to_baserow(parts: list[dict], requirements: list[dict], warnings: list[
             raise
 
 
-def main() -> int:
-    target = parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))
-    prefixes = [p.strip() for p in os.environ.get("PARTNUMBER_PREFIXES", "").split(",") if p.strip()]
-    raw_items = fetch_bom(target)
+def environment_flag(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{name} must be a boolean value")
+
+
+def run_sync(
+    target: OnshapeTarget,
+    prefixes: list[str],
+    *,
+    dry_run: bool = False,
+    output_json: str = "",
+) -> dict:
+    released = resolve_latest_released_assembly(target)
+    released_target = released.bom_target(target.base_url)
+    raw_items = fetch_bom(released_target)
     parts, requirements, warnings = build_records(raw_items, prefixes)
-    print(f"Onshape rows={len(raw_items)} parts={len(parts)} production_requirements={len(requirements)}")
+    print(
+        "Released assembly "
+        f"part={released.part_number or '(none)'} "
+        f"revision={released.revision or '(unnamed)'} "
+        f"version={released.version_id} "
+        f"configuration={released.configuration}"
+    )
+    print(
+        f"Onshape rows={len(raw_items)} parts={len(parts)} "
+        f"production_requirements={len(requirements)}"
+    )
     for warning in warnings:
         print(f"WARNING: {warning}")
+
+    if dry_run:
+        result = {
+            "dry_run": True,
+            "source_revision": released.as_dict(),
+            "source_rows": len(raw_items),
+            "parts": parts,
+            "requirements": requirements,
+            "warnings": warnings,
+        }
+        print("DRY RUN: no Baserow API calls were made")
+        if output_json:
+            destination = Path(output_json)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            print(f"Dry-run JSON written to {destination}")
+        return result
+
+    if output_json:
+        raise ValueError("--output-json is only available with --dry-run")
     summary = sync_to_baserow(parts, requirements, warnings, source_rows=len(raw_items))
     print(json.dumps(summary, indent=2))
+    return summary
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=environment_flag("DRY_RUN"),
+        help="resolve the released BOM and build records without calling Baserow",
+    )
+    parser.add_argument(
+        "--output-json",
+        default=os.environ.get("DRY_RUN_OUTPUT", "").strip(),
+        metavar="PATH",
+        help="write dry-run source revision, parts, and requirements to PATH",
+    )
+    args = parser.parse_args(argv)
+
+    target = parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))
+    prefixes = [
+        p.strip()
+        for p in os.environ.get("PARTNUMBER_PREFIXES", "").split(",")
+        if p.strip()
+    ]
+    run_sync(
+        target,
+        prefixes,
+        dry_run=args.dry_run,
+        output_json=args.output_json,
+    )
     return 0
 
 
