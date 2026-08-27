@@ -253,6 +253,63 @@ def resolve_latest_released_assembly(target: OnshapeTarget) -> ReleasedAssembly:
     return released
 
 
+def normalize_bom_rows(headers: list[dict], rows: list[dict]) -> list[dict]:
+    """Decode v16 BOM cells from header IDs into their property names."""
+    property_names = {}
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        header_id = str(
+            header.get("id")
+            or header.get("headerId")
+            or header.get("propertyId")
+            or ""
+        ).strip()
+        property_name = str(header.get("propertyName") or "").strip()
+        if header_id and property_name:
+            property_names[header_id] = property_name
+
+    normalized = []
+    for original in rows:
+        if not isinstance(original, dict):
+            raise RuntimeError("Unexpected Onshape BOM response: row is not an object")
+        row = dict(original)
+        values = row.pop("headerIdToValue", None)
+        if values is None:
+            normalized.append(row)
+            continue
+        if not isinstance(values, dict):
+            raise RuntimeError(
+                "Unexpected Onshape BOM response: headerIdToValue is not an object"
+            )
+        if not property_names and values:
+            raise RuntimeError(
+                "Unexpected Onshape BOM response: rows use header IDs but no headers "
+                "define property names"
+            )
+        for header_id, value in values.items():
+            property_name = property_names.get(str(header_id))
+            if property_name:
+                row[property_name] = value
+        normalized.append(row)
+    return normalized
+
+
+def bom_rows_from_container(container: dict) -> list[dict] | None:
+    """Return flat rows from either the v16 or legacy BOM container shape."""
+    headers = container.get("headers")
+    for key in ("rows", "items", "bomItems", "bomRows"):
+        rows = container.get(key)
+        if not isinstance(rows, list):
+            continue
+        if any(isinstance(row, dict) and "headerIdToValue" in row for row in rows):
+            if not isinstance(headers, list):
+                headers = []
+            return normalize_bom_rows(headers, rows)
+        return rows
+    return None
+
+
 def fetch_bom(target: OnshapeTarget) -> list[dict]:
     endpoint = (
         f"{target.base_url}/api/{ONSHAPE_API_VERSION}/assemblies/d/{target.did}/"
@@ -270,21 +327,22 @@ def fetch_bom(target: OnshapeTarget) -> list[dict]:
     url = f"{endpoint}?{urlencode(params)}"
     payload = onshape_get_json(url)
     if isinstance(payload.get("bomTable"), dict):
-        items = payload["bomTable"].get("items")
-        if isinstance(items, list):
-            return items
-    for key in ("items", "rows", "bomItems", "bomRows"):
-        if isinstance(payload.get(key), list):
-            return payload[key]
+        rows = bom_rows_from_container(payload["bomTable"])
+        if rows is not None:
+            return rows
+    rows = bom_rows_from_container(payload)
+    if rows is not None:
+        return rows
     raise RuntimeError("Unexpected Onshape BOM response: no items array")
 
 
 def indent_level(row: dict) -> int:
+    value = row.get("indentLevel")
     source = row.get("itemSource")
-    if not isinstance(source, dict):
-        return 0
+    if value is None and isinstance(source, dict):
+        value = source.get("indentLevel", 0)
     try:
-        return int(source.get("indentLevel", 0))
+        return int(value or 0)
     except (TypeError, ValueError):
         return 0
 
@@ -318,10 +376,16 @@ def material_name(value) -> str:
 
 def source_url_and_configuration(value) -> tuple[str, str]:
     if isinstance(value, dict):
-        url = str(value.get("viewHref") or "").strip()
+        url = str(value.get("viewHref") or value.get("href") or "").strip()
+        source_configuration = str(
+            value.get("configuration") or value.get("fullConfiguration") or ""
+        ).strip()
     else:
         url = str(value or "").strip()
-    configuration = parse_qs(urlparse(url).query).get("configuration", ["default"])[0]
+        source_configuration = ""
+    configuration = parse_qs(urlparse(url).query).get(
+        "configuration", [source_configuration or "default"]
+    )[0]
     return url, configuration or "default"
 
 
