@@ -9,7 +9,7 @@ on:
         default: false
         type: boolean
       onshape_doc_url:
-        description: Optional assembly URL override for dry runs
+        description: Optional assembly URL override for manual runs
         required: false
         type: string
   repository_dispatch:
@@ -51,7 +51,9 @@ jobs:
         env:
           ONSHAPE_ACCESS_KEY: ${{ secrets.ONSHAPE_ACCESS_KEY }}
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
-          ONSHAPE_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_EPSILON }}
+          ONSHAPE_DOC_URL: >-
+            ${{ github.event_name == 'workflow_dispatch' &&
+                inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_EPSILON }}
           PARTNUMBER_PREFIXES: "P-190B-26"
 
           BASEROW_API_URL: ${{ vars.BASEROW_API_URL || 'https://api.baserow.io/api' }}

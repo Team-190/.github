@@ -36,6 +36,17 @@ gh workflow run onshape_baserow_poot_horse.yml \
   -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
 ```
 
-The URL override is consumed only by the dry-run job. If it is omitted, that job
-uses the workflow's existing `ONSHAPE_DOC_URL` secret; production always uses
-the secret regardless of the input.
+The URL override is consumed by manual workflow runs, including production runs
+from the default branch. If it is omitted, the workflow uses its existing
+`ONSHAPE_DOC_URL` secret. Scheduled and repository-dispatch production runs
+always use the secret. Because `dry_run=false` writes to Baserow, validate the
+same override with a dry run before using it for production.
+
+After validation, a default-branch production override can be dispatched with:
+
+```text
+gh workflow run onshape_baserow_poot_horse.yml \
+  --ref main \
+  -f dry_run=false \
+  -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
+```

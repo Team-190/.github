@@ -125,9 +125,11 @@ gh workflow run onshape_baserow_poot_horse.yml --ref <implementation-branch> -f 
 ```
 
 The optional manual `onshape_doc_url` input replaces the workflow's document
-secret only inside the dry-run job. This makes it possible to treat any assembly
-tab as the tracked root for a diagnostic run. For example, to validate release
-resolution using A-26C-0004 while leaving the poot_horse production URL intact:
+secret for either a dry run or a production run dispatched from the default
+branch. Scheduled and repository-dispatch runs always use the secret. This makes
+it possible to treat any assembly tab as the tracked root for a diagnostic run.
+For example, to validate release resolution using A-26C-0004 while leaving the
+poot_horse production URL intact:
 
 ```text
 gh workflow run onshape_baserow_poot_horse.yml \
@@ -139,7 +141,18 @@ gh workflow run onshape_baserow_poot_horse.yml \
 The workflow files already exist on the default branch, which permits
 `workflow_dispatch` to select the implementation branch's version. Selecting
 `dry_run=false` on a non-default branch runs neither job, so it cannot start a
-production Baserow sync.
+production Baserow sync. A production override on the default branch writes the
+selected assembly's latest released BOM to Baserow, so validate the same URL in
+a dry run first.
+
+After validation, dispatch the production override from the default branch:
+
+```text
+gh workflow run onshape_baserow_poot_horse.yml \
+  --ref main \
+  -f dry_run=false \
+  -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
+```
 
 For local use:
 
