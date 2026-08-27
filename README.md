@@ -20,3 +20,17 @@ Each command checks out the selected branch, resolves the released assembly and
 BOM, and uploads the resulting JSON. The isolated dry-run job has no Baserow
 URL, token, or table IDs. Manual production jobs can run only from the default
 branch, while scheduled production syncs are unchanged.
+
+For example, A-26C-0004 can be treated as the tracked root for a one-off release
+resolution test without changing the poot_horse production secret:
+
+```text
+gh workflow run onshape_baserow_poot_horse.yml \
+  --ref <implementation-branch> \
+  -f dry_run=true \
+  -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
+```
+
+The URL override is consumed only by the dry-run job. If it is omitted, that job
+uses the workflow's existing `ONSHAPE_DOC_URL` secret; production always uses
+the secret regardless of the input.

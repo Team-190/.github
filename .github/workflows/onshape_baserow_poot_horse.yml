@@ -8,6 +8,10 @@ on:
         required: false
         default: false
         type: boolean
+      onshape_doc_url:
+        description: Optional assembly URL override for dry runs
+        required: false
+        type: string
   repository_dispatch:
     types: [bom_sync_poot_horse_baserow]
   schedule:
@@ -85,7 +89,7 @@ jobs:
         env:
           ONSHAPE_ACCESS_KEY: ${{ secrets.ONSHAPE_ACCESS_KEY }}
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
-          ONSHAPE_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_EPSILON }}
+          ONSHAPE_DOC_URL: ${{ inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_EPSILON }}
           PARTNUMBER_PREFIXES: "P-190C-26"
         run: >-
           python pre-2027-onshape_ci/OnshapeToBaserow.py
