@@ -7,6 +7,7 @@ machinist, finishing, location, QC, and disposition are intentionally untouched.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import hmac
@@ -16,13 +17,16 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from urllib.parse import parse_qs, urlencode, urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import requests
 
 
 ASSEMBLY_NAME_RE = re.compile(r"^A-[A-Za-z0-9-]+$")
 BATCH_SIZE = 100
+ONSHAPE_API_VERSION = "v16"
+ASSEMBLY_ELEMENT_TYPE = 1
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,51 @@ class OnshapeTarget:
     wvm_type: str
     wvm_id: str
     eid: str
+    configuration: str = "default"
+
+
+@dataclass(frozen=True)
+class ReleasedAssembly:
+    document_id: str
+    element_id: str
+    version_id: str
+    revision: str
+    part_number: str
+    name: str
+    configuration: str
+    release_id: str
+    release_name: str
+    version_name: str
+    created_at: str
+    is_obsolete: bool
+    view_ref: str
+
+    def bom_target(self, base_url: str) -> OnshapeTarget:
+        return OnshapeTarget(
+            base_url=base_url,
+            did=self.document_id,
+            wvm_type="v",
+            wvm_id=self.version_id,
+            eid=self.element_id,
+            configuration=self.configuration,
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "document_id": self.document_id,
+            "element_id": self.element_id,
+            "version_id": self.version_id,
+            "revision": self.revision,
+            "part_number": self.part_number,
+            "name": self.name,
+            "configuration": self.configuration,
+            "release_id": self.release_id,
+            "release_name": self.release_name,
+            "version_name": self.version_name,
+            "created_at": self.created_at,
+            "is_obsolete": self.is_obsolete,
+            "view_ref": self.view_ref,
+        }
 
 
 def require_env(name: str) -> str:
@@ -54,12 +103,16 @@ def parse_onshape_doc_url(doc_url: str) -> OnshapeTarget:
     if not parsed.scheme or not parsed.netloc or not match:
         raise ValueError("ONSHAPE_DOC_URL must be a full Onshape assembly-tab URL")
     did, wvm_type, wvm_id, eid = match.groups()
+    configuration = parse_qs(parsed.query, keep_blank_values=True).get(
+        "configuration", ["default"]
+    )[0]
     return OnshapeTarget(
         base_url=f"{parsed.scheme}://{parsed.netloc}",
         did=did,
         wvm_type=wvm_type,
         wvm_id=wvm_id,
         eid=eid,
+        configuration=configuration or "default",
     )
 
 
@@ -87,9 +140,179 @@ def onshape_headers(method: str, full_url: str) -> dict[str, str]:
     }
 
 
+def onshape_get_json(url: str) -> dict:
+    response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected Onshape response from {url}: expected an object")
+    return payload
+
+
+def normalized_configuration(value) -> str:
+    configuration = str(value or "").strip()
+    return configuration if configuration and configuration.lower() != "default" else "default"
+
+
+def metadata_property(payload: dict, property_name: str) -> str:
+    """Return a named Onshape metadata property value."""
+    properties = payload.get("properties")
+    if not isinstance(properties, list):
+        raise RuntimeError("Unexpected Onshape element metadata: no properties array")
+    wanted = property_name.casefold()
+    for item in properties:
+        if (
+            isinstance(item, dict)
+            and str(item.get("name") or "").strip().casefold() == wanted
+        ):
+            return str(item.get("value") or "").strip()
+    return ""
+
+
+def fetch_assembly_part_number(target: OnshapeTarget) -> str:
+    """Resolve the tracked workspace assembly element to its part number."""
+    endpoint = (
+        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/metadata/d/{target.did}/"
+        f"{target.wvm_type}/{target.wvm_id}/e/{target.eid}"
+    )
+    params = {
+        "includeComputedProperties": "true",
+        "includeComputedAssemblyProperties": "true",
+    }
+    payload = onshape_get_json(f"{endpoint}?{urlencode(params)}")
+    part_number = metadata_property(payload, "Part number")
+    if not part_number:
+        raise RuntimeError(
+            "The assembly element in ONSHAPE_DOC_URL has no Part number metadata"
+        )
+    return part_number
+
+
+def fetch_latest_assembly_revision(
+    target: OnshapeTarget, part_number: str
+) -> dict:
+    """Fetch the latest assembly revision for a company-owned part number."""
+    encoded_part_number = quote(part_number, safe="")
+    endpoint = (
+        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/revisions/d/{target.did}/"
+        f"p/{encoded_part_number}/latest"
+    )
+    return onshape_get_json(
+        f"{endpoint}?{urlencode({'et': ASSEMBLY_ELEMENT_TYPE})}"
+    )
+
+
+def released_assembly_from_revision(latest: dict) -> ReleasedAssembly:
+    """Build an immutable BOM source solely from the returned revision record."""
+    if latest.get("elementType") not in (None, ASSEMBLY_ELEMENT_TYPE):
+        raise RuntimeError("Latest revision for the tracked part number is not an assembly")
+
+    required_ids = {
+        "documentId": "document",
+        "elementId": "element",
+        "versionId": "immutable version",
+    }
+    resolved_ids = {
+        field: str(latest.get(field) or "").strip() for field in required_ids
+    }
+    missing = [label for field, label in required_ids.items() if not resolved_ids[field]]
+    if missing:
+        raise RuntimeError(
+            "Latest released assembly revision has no " + ", ".join(missing) + " ID"
+        )
+
+    return ReleasedAssembly(
+        document_id=resolved_ids["documentId"],
+        element_id=resolved_ids["elementId"],
+        version_id=resolved_ids["versionId"],
+        revision=str(latest.get("revision") or "").strip(),
+        part_number=str(latest.get("partNumber") or "").strip(),
+        name=str(latest.get("name") or "").strip(),
+        configuration=normalized_configuration(latest.get("configuration")),
+        release_id=str(latest.get("releaseId") or "").strip(),
+        release_name=str(latest.get("releaseName") or "").strip(),
+        version_name=str(latest.get("versionName") or "").strip(),
+        created_at=str(
+            latest.get("releaseCreatedDate") or latest.get("createdAt") or ""
+        ).strip(),
+        is_obsolete=bool(latest.get("isObsolete")),
+        view_ref=str(latest.get("viewRef") or "").strip(),
+    )
+
+
+def resolve_latest_released_assembly(target: OnshapeTarget) -> ReleasedAssembly:
+    if target.wvm_type != "w":
+        raise ValueError("ONSHAPE_DOC_URL must point to the assembly in a workspace (Main)")
+    part_number = fetch_assembly_part_number(target)
+    latest = fetch_latest_assembly_revision(target, part_number)
+    released = released_assembly_from_revision(latest)
+    if released.part_number and released.part_number != part_number:
+        raise RuntimeError(
+            "Onshape latest-revision response returned a different part number"
+        )
+    return released
+
+
+def normalize_bom_rows(headers: list[dict], rows: list[dict]) -> list[dict]:
+    """Decode v16 BOM cells from header IDs into their property names."""
+    property_names = {}
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        header_id = str(
+            header.get("id")
+            or header.get("headerId")
+            or header.get("propertyId")
+            or ""
+        ).strip()
+        property_name = str(header.get("propertyName") or "").strip()
+        if header_id and property_name:
+            property_names[header_id] = property_name
+
+    normalized = []
+    for original in rows:
+        if not isinstance(original, dict):
+            raise RuntimeError("Unexpected Onshape BOM response: row is not an object")
+        row = dict(original)
+        values = row.pop("headerIdToValue", None)
+        if values is None:
+            normalized.append(row)
+            continue
+        if not isinstance(values, dict):
+            raise RuntimeError(
+                "Unexpected Onshape BOM response: headerIdToValue is not an object"
+            )
+        if not property_names and values:
+            raise RuntimeError(
+                "Unexpected Onshape BOM response: rows use header IDs but no headers "
+                "define property names"
+            )
+        for header_id, value in values.items():
+            property_name = property_names.get(str(header_id))
+            if property_name:
+                row[property_name] = value
+        normalized.append(row)
+    return normalized
+
+
+def bom_rows_from_container(container: dict) -> list[dict] | None:
+    """Return flat rows from either the v16 or legacy BOM container shape."""
+    headers = container.get("headers")
+    for key in ("rows", "items", "bomItems", "bomRows"):
+        rows = container.get(key)
+        if not isinstance(rows, list):
+            continue
+        if any(isinstance(row, dict) and "headerIdToValue" in row for row in rows):
+            if not isinstance(headers, list):
+                headers = []
+            return normalize_bom_rows(headers, rows)
+        return rows
+    return None
+
+
 def fetch_bom(target: OnshapeTarget) -> list[dict]:
     endpoint = (
-        f"{target.base_url}/api/assemblies/d/{target.did}/"
+        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/assemblies/d/{target.did}/"
         f"{target.wvm_type}/{target.wvm_id}/e/{target.eid}/bom"
     )
     params = {
@@ -99,27 +322,27 @@ def fetch_bom(target: OnshapeTarget) -> list[dict]:
         "includeItemMicroversions": "false",
         "includeTopLevelAssemblyRow": "false",
         "thumbnail": "false",
+        "configuration": target.configuration,
     }
     url = f"{endpoint}?{urlencode(params)}"
-    response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
-    response.raise_for_status()
-    payload = response.json()
+    payload = onshape_get_json(url)
     if isinstance(payload.get("bomTable"), dict):
-        items = payload["bomTable"].get("items")
-        if isinstance(items, list):
-            return items
-    for key in ("items", "rows", "bomItems", "bomRows"):
-        if isinstance(payload.get(key), list):
-            return payload[key]
+        rows = bom_rows_from_container(payload["bomTable"])
+        if rows is not None:
+            return rows
+    rows = bom_rows_from_container(payload)
+    if rows is not None:
+        return rows
     raise RuntimeError("Unexpected Onshape BOM response: no items array")
 
 
 def indent_level(row: dict) -> int:
+    value = row.get("indentLevel")
     source = row.get("itemSource")
-    if not isinstance(source, dict):
-        return 0
+    if value is None and isinstance(source, dict):
+        value = source.get("indentLevel", 0)
     try:
-        return int(source.get("indentLevel", 0))
+        return int(value or 0)
     except (TypeError, ValueError):
         return 0
 
@@ -153,10 +376,16 @@ def material_name(value) -> str:
 
 def source_url_and_configuration(value) -> tuple[str, str]:
     if isinstance(value, dict):
-        url = str(value.get("viewHref") or "").strip()
+        url = str(value.get("viewHref") or value.get("href") or "").strip()
+        source_configuration = str(
+            value.get("configuration") or value.get("fullConfiguration") or ""
+        ).strip()
     else:
         url = str(value or "").strip()
-    configuration = parse_qs(urlparse(url).query).get("configuration", ["default"])[0]
+        source_configuration = ""
+    configuration = parse_qs(urlparse(url).query).get(
+        "configuration", [source_configuration or "default"]
+    )[0]
     return url, configuration or "default"
 
 
@@ -385,19 +614,96 @@ def sync_to_baserow(parts: list[dict], requirements: list[dict], warnings: list[
             raise
 
 
-def main() -> int:
-    target = parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))
-    prefixes = [p.strip() for p in os.environ.get("PARTNUMBER_PREFIXES", "").split(",") if p.strip()]
-    raw_items = fetch_bom(target)
+def environment_flag(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{name} must be a boolean value")
+
+
+def run_sync(
+    target: OnshapeTarget,
+    prefixes: list[str],
+    *,
+    dry_run: bool = False,
+    output_json: str = "",
+) -> dict:
+    released = resolve_latest_released_assembly(target)
+    released_target = released.bom_target(target.base_url)
+    raw_items = fetch_bom(released_target)
     parts, requirements, warnings = build_records(raw_items, prefixes)
-    print(f"Onshape rows={len(raw_items)} parts={len(parts)} production_requirements={len(requirements)}")
+    print(
+        "Released assembly "
+        f"part={released.part_number or '(none)'} "
+        f"revision={released.revision or '(unnamed)'} "
+        f"version={released.version_id} "
+        f"configuration={released.configuration}"
+    )
+    print(
+        f"Onshape rows={len(raw_items)} parts={len(parts)} "
+        f"production_requirements={len(requirements)}"
+    )
     for warning in warnings:
         print(f"WARNING: {warning}")
+
+    if dry_run:
+        result = {
+            "dry_run": True,
+            "source_revision": released.as_dict(),
+            "source_rows": len(raw_items),
+            "parts": parts,
+            "requirements": requirements,
+            "warnings": warnings,
+        }
+        print("DRY RUN: no Baserow API calls were made")
+        if output_json:
+            destination = Path(output_json)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            print(f"Dry-run JSON written to {destination}")
+        return result
+
+    if output_json:
+        raise ValueError("--output-json is only available with --dry-run")
     summary = sync_to_baserow(parts, requirements, warnings, source_rows=len(raw_items))
     print(json.dumps(summary, indent=2))
+    return summary
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=environment_flag("DRY_RUN"),
+        help="resolve the released BOM and build records without calling Baserow",
+    )
+    parser.add_argument(
+        "--output-json",
+        default=os.environ.get("DRY_RUN_OUTPUT", "").strip(),
+        metavar="PATH",
+        help="write dry-run source revision, parts, and requirements to PATH",
+    )
+    args = parser.parse_args(argv)
+
+    target = parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))
+    prefixes = [
+        p.strip()
+        for p in os.environ.get("PARTNUMBER_PREFIXES", "").split(",")
+        if p.strip()
+    ]
+    run_sync(
+        target,
+        prefixes,
+        dry_run=args.dry_run,
+        output_json=args.output_json,
+    )
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
- 
