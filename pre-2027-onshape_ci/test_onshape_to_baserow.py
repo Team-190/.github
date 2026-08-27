@@ -36,6 +36,8 @@ WID = "b" * 24
 EID = "c" * 24
 VID_A = "d" * 24
 VID_B = "e" * 24
+RELEASE_DID = "f" * 24
+RELEASE_EID = "9" * 24
 
 
 def target(configuration="default"):
@@ -71,47 +73,75 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(parsed.wvm_type, "w")
         self.assertEqual(parsed.configuration, "size=Large+length=1+meter")
 
-    def test_selects_latest_terminal_revision_for_exact_assembly(self):
-        older = revision("A", VID_A, nextRevisionId="revision-B")
-        latest = revision("B", VID_B)
-        unrelated = revision("Z", "f" * 24, elementId="9" * 24)
-        wrong_type = revision("Z", "8" * 24, elementType=0)
-        wrong_config = revision(
-            "Z", "7" * 24, configuration="size=Small", releaseCreatedDate="2026-12-01T00:00:00Z"
-        )
-
-        selected = MODULE.select_latest_released_assembly(
-            target(), [latest, unrelated, older, wrong_type, wrong_config]
-        )
-
-        self.assertEqual(selected.revision, "B")
-        self.assertEqual(selected.version_id, VID_B)
-        self.assertEqual(selected.part_number, "A-190B-260001")
-
-    def test_release_resolution_follows_pagination(self):
-        first_url = f"https://cad.onshape.com/api/v16/revisions/d/{DID}"
-        second_url = first_url + "?after=cursor"
-        responses = {
-            first_url: FakeResponse(
-                {"items": [revision("A", VID_A, nextRevisionId="revision-B")], "next": second_url}
-            ),
-            second_url: FakeResponse({"items": [revision("B", VID_B)], "next": None}),
+    def test_release_resolution_uses_part_number_and_returned_coordinates(self):
+        metadata = {
+            "properties": [
+                {"name": "Name", "value": "Kicker"},
+                {"name": "Part number", "value": "A-26C-0004"},
+            ]
         }
+        latest = revision(
+            "C",
+            VID_B,
+            documentId=RELEASE_DID,
+            elementId=RELEASE_EID,
+            partNumber="A-26C-0004",
+            configuration="Kicker Position=Free",
+        )
 
-        with patch.object(MODULE, "onshape_headers", return_value={}), patch.object(
-            MODULE.requests, "get", side_effect=lambda url, **_: responses[url], create=True
-        ) as get:
-            selected = MODULE.resolve_latest_released_assembly(target())
+        with patch.object(
+            MODULE, "onshape_get_json", side_effect=[metadata, latest]
+        ) as get_json:
+            selected = MODULE.resolve_latest_released_assembly(
+                target(configuration="default")
+            )
 
+        metadata_url = get_json.call_args_list[0].args[0]
+        latest_url = get_json.call_args_list[1].args[0]
+        self.assertIn(f"/metadata/d/{DID}/w/{WID}/e/{EID}", metadata_url)
+        self.assertNotIn("configuration=", metadata_url)
+        self.assertIn(f"/revisions/d/{DID}/p/A-26C-0004/latest", latest_url)
+        self.assertIn("et=1", latest_url)
+        self.assertEqual(selected.document_id, RELEASE_DID)
+        self.assertEqual(selected.element_id, RELEASE_EID)
         self.assertEqual(selected.version_id, VID_B)
-        self.assertEqual(get.call_count, 2)
+        self.assertEqual(selected.configuration, "Kicker Position=Free")
+
+    def test_part_number_is_url_encoded_for_latest_revision_lookup(self):
+        with patch.object(MODULE, "onshape_get_json", return_value={}) as get_json:
+            MODULE.fetch_latest_assembly_revision(target(), "A 1/2")
+
+        requested_url = get_json.call_args.args[0]
+        self.assertIn("/p/A%201%2F2/latest", requested_url)
+        self.assertIn("et=1", requested_url)
 
     def test_no_release_fails_instead_of_falling_back_to_main(self):
-        with self.assertRaisesRegex(RuntimeError, "No released assembly revision"):
-            MODULE.select_latest_released_assembly(target(), [])
+        metadata = {"properties": [{"name": "Part number", "value": "A-26C-0004"}]}
+        with patch.object(
+            MODULE, "onshape_get_json", side_effect=[metadata, {}]
+        ), self.assertRaisesRegex(RuntimeError, "immutable version"):
+            MODULE.resolve_latest_released_assembly(target())
+
+    def test_missing_workspace_part_number_fails_before_revision_lookup(self):
+        with patch.object(
+            MODULE,
+            "onshape_get_json",
+            return_value={"properties": [{"name": "Part number", "value": ""}]},
+        ) as get_json, self.assertRaisesRegex(RuntimeError, "no Part number"):
+            MODULE.resolve_latest_released_assembly(target())
+
+        self.assertEqual(get_json.call_count, 1)
 
     def test_bom_is_fetched_from_immutable_released_version(self):
-        released = MODULE.select_latest_released_assembly(target(), [revision("B", VID_B)])
+        released = MODULE.released_assembly_from_revision(
+            revision(
+                "B",
+                VID_B,
+                documentId=RELEASE_DID,
+                elementId=RELEASE_EID,
+                configuration="Kicker Position=Free",
+            )
+        )
         response = FakeResponse({"bomTable": {"items": [{"partNumber": "P-190B-260001"}]}})
 
         with patch.object(MODULE, "onshape_headers", return_value={}), patch.object(
@@ -120,12 +150,16 @@ class ReleaseResolutionTests(unittest.TestCase):
             rows = MODULE.fetch_bom(released.bom_target("https://cad.onshape.com"))
 
         requested_url = get.call_args.args[0]
-        self.assertIn(f"/assemblies/d/{DID}/v/{VID_B}/e/{EID}/bom", requested_url)
+        self.assertIn(
+            f"/assemblies/d/{RELEASE_DID}/v/{VID_B}/e/{RELEASE_EID}/bom",
+            requested_url,
+        )
         self.assertNotIn(f"/w/{WID}/", requested_url)
+        self.assertIn("configuration=Kicker+Position%3DFree", requested_url)
         self.assertEqual(rows[0]["partNumber"], "P-190B-260001")
 
     def test_dry_run_writes_records_without_baserow(self):
-        released = MODULE.select_latest_released_assembly(target(), [revision("B", VID_B)])
+        released = MODULE.released_assembly_from_revision(revision("B", VID_B))
         rows = [
             {"name": "A-190B-260001", "partNumber": "", "itemSource": source("", 0)},
             {

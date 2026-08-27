@@ -21,6 +21,11 @@ BOM, and uploads the resulting JSON. The isolated dry-run job has no Baserow
 URL, token, or table IDs. Manual production jobs can run only from the default
 branch, while scheduled production syncs are unchanged.
 
+Release resolution reads the tracked Main assembly's Part number and calls the
+Onshape latest-revision API for that assembly part number. The revision's own
+immutable document/version/element/configuration coordinates—not a possibly
+missing configuration query in the Main URL—define the BOM baseline.
+
 For example, A-26C-0004 can be treated as the tracked root for a one-off release
 resolution test without changing the poot_horse production secret:
 

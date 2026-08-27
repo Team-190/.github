@@ -5,11 +5,13 @@ status, machine, machinist, finishing, current location, QC outcome, or
 disposition on an existing production requirement.
 
 `ONSHAPE_DOC_URL` must point to the tracked top-level assembly tab in Main. The
-sync finds the latest released revision for that exact assembly and
-configuration, resolves its immutable Onshape version, and reads the multilevel
-BOM from that version. Child parts are not independently upgraded: the part
-revisions captured by the released top-level assembly are the production
-baseline.
+sync reads that element's Part number metadata, asks Onshape for the latest
+assembly revision of that part number (`et=1`), and reads the multilevel BOM from
+the document, version, element, and configuration returned by the revision. The
+Main URL's configuration query is not used to filter revisions because Onshape
+can omit it for a configured assembly. Child parts are not independently
+upgraded: the part revisions captured by the released top-level assembly are the
+production baseline.
 
 ## Required tables
 

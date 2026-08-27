@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import requests
 
@@ -154,81 +154,77 @@ def normalized_configuration(value) -> str:
     return configuration if configuration and configuration.lower() != "default" else "default"
 
 
-def fetch_document_revisions(target: OnshapeTarget) -> list[dict]:
-    """Fetch every revision page for the document containing the tracked assembly."""
-    url = (
-        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/revisions/d/{target.did}"
-    )
-    expected_origin = urlparse(target.base_url)
-    revisions: list[dict] = []
-    seen_urls: set[str] = set()
-    while url:
-        if url in seen_urls:
-            raise RuntimeError("Onshape revision pagination returned a cycle")
-        seen_urls.add(url)
-        payload = onshape_get_json(url)
-        page_items = payload.get("items")
-        if not isinstance(page_items, list):
-            raise RuntimeError("Unexpected Onshape revisions response: no items array")
-        revisions.extend(item for item in page_items if isinstance(item, dict))
-
-        next_url = str(payload.get("next") or "").strip()
-        if not next_url:
-            break
-        url = urljoin(url, next_url)
-        parsed_next = urlparse(url)
+def metadata_property(payload: dict, property_name: str) -> str:
+    """Return a named Onshape metadata property value."""
+    properties = payload.get("properties")
+    if not isinstance(properties, list):
+        raise RuntimeError("Unexpected Onshape element metadata: no properties array")
+    wanted = property_name.casefold()
+    for item in properties:
         if (
-            parsed_next.scheme != expected_origin.scheme
-            or parsed_next.netloc != expected_origin.netloc
+            isinstance(item, dict)
+            and str(item.get("name") or "").strip().casefold() == wanted
         ):
-            raise RuntimeError("Onshape revision pagination changed API origin")
-    return revisions
+            return str(item.get("value") or "").strip()
+    return ""
 
 
-def select_latest_released_assembly(
-    target: OnshapeTarget, revisions: list[dict]
-) -> ReleasedAssembly:
-    """Select the latest released revision for exactly the tracked assembly/config."""
-    target_configuration = normalized_configuration(target.configuration)
-    candidates = [
-        item
-        for item in revisions
-        if str(item.get("documentId") or "") == target.did
-        and str(item.get("elementId") or "") == target.eid
-        and item.get("elementType") == ASSEMBLY_ELEMENT_TYPE
-        and normalized_configuration(item.get("configuration"))
-        == target_configuration
-    ]
-    if not candidates:
-        raise RuntimeError(
-            "No released assembly revision found for the element/configuration in "
-            "ONSHAPE_DOC_URL"
-        )
-
-    # Onshape documents nextRevisionId as null on the latest revision. There can
-    # be more than one terminal history after part-number reuse, so timestamps
-    # provide the final ordering without assuming revision names are sortable.
-    latest_candidates = [item for item in candidates if not item.get("nextRevisionId")]
-    if not latest_candidates:
-        raise RuntimeError(
-            "Onshape returned no terminal revision for the tracked assembly; "
-            "refusing to guess a configuration baseline"
-        )
-    latest = max(
-        latest_candidates,
-        key=lambda item: (
-            str(item.get("releaseCreatedDate") or item.get("createdAt") or ""),
-            str(item.get("id") or ""),
-        ),
+def fetch_assembly_part_number(target: OnshapeTarget) -> str:
+    """Resolve the tracked workspace assembly element to its part number."""
+    endpoint = (
+        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/metadata/d/{target.did}/"
+        f"{target.wvm_type}/{target.wvm_id}/e/{target.eid}"
     )
-    version_id = str(latest.get("versionId") or "").strip()
-    if not version_id:
-        raise RuntimeError("Latest released assembly revision has no immutable versionId")
+    params = {
+        "includeComputedProperties": "true",
+        "includeComputedAssemblyProperties": "true",
+    }
+    payload = onshape_get_json(f"{endpoint}?{urlencode(params)}")
+    part_number = metadata_property(payload, "Part number")
+    if not part_number:
+        raise RuntimeError(
+            "The assembly element in ONSHAPE_DOC_URL has no Part number metadata"
+        )
+    return part_number
+
+
+def fetch_latest_assembly_revision(
+    target: OnshapeTarget, part_number: str
+) -> dict:
+    """Fetch the latest assembly revision for a company-owned part number."""
+    encoded_part_number = quote(part_number, safe="")
+    endpoint = (
+        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/revisions/d/{target.did}/"
+        f"p/{encoded_part_number}/latest"
+    )
+    return onshape_get_json(
+        f"{endpoint}?{urlencode({'et': ASSEMBLY_ELEMENT_TYPE})}"
+    )
+
+
+def released_assembly_from_revision(latest: dict) -> ReleasedAssembly:
+    """Build an immutable BOM source solely from the returned revision record."""
+    if latest.get("elementType") not in (None, ASSEMBLY_ELEMENT_TYPE):
+        raise RuntimeError("Latest revision for the tracked part number is not an assembly")
+
+    required_ids = {
+        "documentId": "document",
+        "elementId": "element",
+        "versionId": "immutable version",
+    }
+    resolved_ids = {
+        field: str(latest.get(field) or "").strip() for field in required_ids
+    }
+    missing = [label for field, label in required_ids.items() if not resolved_ids[field]]
+    if missing:
+        raise RuntimeError(
+            "Latest released assembly revision has no " + ", ".join(missing) + " ID"
+        )
 
     return ReleasedAssembly(
-        document_id=str(latest.get("documentId") or target.did),
-        element_id=str(latest.get("elementId") or target.eid),
-        version_id=version_id,
+        document_id=resolved_ids["documentId"],
+        element_id=resolved_ids["elementId"],
+        version_id=resolved_ids["versionId"],
         revision=str(latest.get("revision") or "").strip(),
         part_number=str(latest.get("partNumber") or "").strip(),
         name=str(latest.get("name") or "").strip(),
@@ -247,7 +243,14 @@ def select_latest_released_assembly(
 def resolve_latest_released_assembly(target: OnshapeTarget) -> ReleasedAssembly:
     if target.wvm_type != "w":
         raise ValueError("ONSHAPE_DOC_URL must point to the assembly in a workspace (Main)")
-    return select_latest_released_assembly(target, fetch_document_revisions(target))
+    part_number = fetch_assembly_part_number(target)
+    latest = fetch_latest_assembly_revision(target, part_number)
+    released = released_assembly_from_revision(latest)
+    if released.part_number and released.part_number != part_number:
+        raise RuntimeError(
+            "Onshape latest-revision response returned a different part number"
+        )
+    return released
 
 
 def fetch_bom(target: OnshapeTarget) -> list[dict]:
@@ -640,4 +643,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
- 
