@@ -469,9 +469,23 @@ def normalized_part_number(value) -> str:
 
 
 def is_drawing_element(element: dict) -> bool:
-    return str(
+    element_type = str(
         element.get("elementType") or element.get("type") or ""
-    ).strip().casefold() == "drawing"
+    ).strip().casefold()
+    if element_type == "drawing":
+        return True
+    structured_markers = (
+        element.get("mimeType"),
+        element.get("dataType"),
+        element.get("applicationType"),
+    )
+    if any(
+        "drawing" in str(marker or "").casefold() for marker in structured_markers
+    ):
+        return True
+    return (
+        element_type == "application" or element_type.isdigit()
+    ) and "drawing" in str(element.get("name") or "").casefold()
 
 
 def drawing_urls_for_parts(
@@ -497,10 +511,12 @@ def drawing_urls_for_parts(
             normalized_part_number(part_number)
         ] = part_number
 
-    for reference in extra_references or []:
+    preferred_references = set(extra_references or [])
+    for reference in preferred_references:
         expected_by_reference.setdefault(reference, {}).update(all_expected)
 
-    matches: dict[str, set[str]] = {}
+    preferred_matches: dict[str, set[str]] = {}
+    fallback_matches: dict[str, set[str]] = {}
     for reference, expected in expected_by_reference.items():
         for element in fetch_document_elements(reference):
             if not is_drawing_element(element):
@@ -525,11 +541,18 @@ def drawing_urls_for_parts(
                     f"{reference.base_url}/documents/{reference.did}/"
                     f"{reference.wvm_type}/{reference.wvm_id}/e/{element_id}"
                 )
-                matches.setdefault(part_number, set()).add(url)
+                match_bucket = (
+                    preferred_matches
+                    if reference in preferred_references
+                    else fallback_matches
+                )
+                match_bucket.setdefault(part_number, set()).add(url)
 
     drawing_urls: dict[str, str] = {}
     warnings: list[str] = []
-    for part_number, urls in sorted(matches.items()):
+    matched_part_numbers = set(preferred_matches) | set(fallback_matches)
+    for part_number in sorted(matched_part_numbers):
+        urls = preferred_matches.get(part_number) or fallback_matches[part_number]
         if len(urls) == 1:
             drawing_urls[part_number] = next(iter(urls))
         else:

@@ -1,1 +1,7 @@
 *.json
+/.idea/.gitignore
+/.idea/FRC190_github_root.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/vcs.xml

@@ -406,7 +406,8 @@ class DrawingLinkTests(unittest.TestCase):
             {
                 "id": "4" * 24,
                 "name": "Right Support Plate Drawing 1",
-                "elementType": "DRAWING",
+                "elementType": "APPLICATION",
+                "mimeType": "application/vnd.onshape.drawing",
             }
         ]
         metadata = {
@@ -452,7 +453,7 @@ class DrawingLinkTests(unittest.TestCase):
                     {
                         "id": drawing_eid,
                         "name": "Right Support Plate Drawing 1",
-                        "elementType": "DRAWING",
+                        "elementType": "APPLICATION",
                     }
                 ]
             return []
@@ -508,6 +509,57 @@ class DrawingLinkTests(unittest.TestCase):
         self.assertNotIn("P-190B-260100", drawing_urls)
         self.assertEqual(len(warnings), 1)
         self.assertIn("Multiple released drawings", warnings[0])
+
+    def test_released_document_match_wins_over_workspace_source_match(self):
+        workspace_reference = MODULE.OnshapeDocumentReference(
+            "https://frc190.onshape.com", "1" * 24, "w", "2" * 24
+        )
+        released_reference = MODULE.OnshapeDocumentReference(
+            "https://frc190.onshape.com", "1" * 24, "v", "3" * 24
+        )
+        drawing_eid = "4" * 24
+        rows = [
+            {
+                "partNumber": "P-190B-260764",
+                "itemSource": {
+                    "documentId": workspace_reference.did,
+                    "wvmType": workspace_reference.wvm_type,
+                    "wvmId": workspace_reference.wvm_id,
+                },
+            }
+        ]
+        elements = [
+            {
+                "id": drawing_eid,
+                "name": "Right Support Plate Drawing 1",
+                "elementType": "APPLICATION",
+            }
+        ]
+
+        with patch.object(
+            MODULE, "fetch_document_elements", return_value=elements
+        ), patch.object(
+            MODULE,
+            "fetch_element_metadata",
+            return_value={
+                "properties": [
+                    {"name": "Part number", "value": "P-190B-260764"}
+                ]
+            },
+        ):
+            drawing_urls, warnings = MODULE.drawing_urls_for_parts(
+                rows,
+                ["P-190B-26"],
+                "https://frc190.onshape.com",
+                [released_reference],
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            drawing_urls["P-190B-260764"],
+            f"https://frc190.onshape.com/documents/{released_reference.did}/"
+            f"v/{released_reference.wvm_id}/e/{drawing_eid}",
+        )
 
 
 class RecordBuildingTests(unittest.TestCase):
