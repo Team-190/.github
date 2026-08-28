@@ -454,6 +454,16 @@ def fetch_document_elements(reference: OnshapeDocumentReference) -> list[dict]:
     return elements
 
 
+def fetch_element_metadata(
+    reference: OnshapeDocumentReference, element_id: str
+) -> dict:
+    endpoint = (
+        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/metadata/d/"
+        f"{reference.did}/{reference.wvm_type}/{reference.wvm_id}/e/{element_id}"
+    )
+    return onshape_get_json(endpoint)
+
+
 def normalized_part_number(value) -> str:
     return str(value or "").strip().casefold()
 
@@ -465,22 +475,30 @@ def is_drawing_element(element: dict) -> bool:
 
 
 def drawing_urls_for_parts(
-    items: list[dict], prefixes: list[str], default_base_url: str
+    items: list[dict],
+    prefixes: list[str],
+    default_base_url: str,
+    extra_references: list[OnshapeDocumentReference] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Find released drawing tabs whose name or part number matches a BOM part."""
+    """Find released drawing tabs whose metadata part number matches a BOM part."""
     expected_by_reference: dict[OnshapeDocumentReference, dict[str, str]] = {}
+    all_expected: dict[str, str] = {}
     for row in items:
         part_number = str(row.get("partNumber") or "").strip()
         if not part_number or (
             prefixes and not any(part_number.startswith(prefix) for prefix in prefixes)
         ):
             continue
+        all_expected[normalized_part_number(part_number)] = part_number
         reference = source_document_reference(row.get("itemSource"), default_base_url)
         if reference is None:
             continue
         expected_by_reference.setdefault(reference, {})[
             normalized_part_number(part_number)
         ] = part_number
+
+    for reference in extra_references or []:
+        expected_by_reference.setdefault(reference, {}).update(all_expected)
 
     matches: dict[str, set[str]] = {}
     for reference, expected in expected_by_reference.items():
@@ -494,6 +512,11 @@ def drawing_urls_for_parts(
                 normalized_part_number(element.get("name")),
                 normalized_part_number(element.get("partNumber")),
             }
+            if not any(candidate_key in expected for candidate_key in candidate_keys):
+                metadata = fetch_element_metadata(reference, element_id)
+                candidate_keys.add(
+                    normalized_part_number(metadata_property(metadata, "Part number"))
+                )
             for candidate_key in candidate_keys - {""}:
                 part_number = expected.get(candidate_key)
                 if not part_number:
@@ -762,7 +785,17 @@ def run_sync(
     raw_items = fetch_bom(released_target)
     parts, requirements, warnings = build_records(raw_items, prefixes)
     drawing_urls, drawing_warnings = drawing_urls_for_parts(
-        raw_items, prefixes, target.base_url
+        raw_items,
+        prefixes,
+        target.base_url,
+        [
+            OnshapeDocumentReference(
+                released_target.base_url.rstrip("/"),
+                released_target.did,
+                released_target.wvm_type,
+                released_target.wvm_id,
+            )
+        ],
     )
     for part in parts:
         part["Onshape Drawing"] = drawing_urls.get(part["Part Number"], "")
@@ -776,7 +809,8 @@ def run_sync(
     )
     print(
         f"Onshape rows={len(raw_items)} parts={len(parts)} "
-        f"production_requirements={len(requirements)}"
+        f"production_requirements={len(requirements)} "
+        f"drawings={len(drawing_urls)}"
     )
     for warning in warnings:
         print(f"WARNING: {warning}")

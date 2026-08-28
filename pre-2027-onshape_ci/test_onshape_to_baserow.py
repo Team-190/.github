@@ -389,7 +389,7 @@ class DrawingLinkTests(unittest.TestCase):
             f"https://cad.onshape.com/documents/{part_did}/v/{part_vid}/e/{drawing_eid}",
         )
 
-    def test_element_part_number_can_match_when_tab_name_does_not(self):
+    def test_drawing_metadata_part_number_matches_when_tab_name_does_not(self):
         part_did = "1" * 24
         part_vid = "2" * 24
         rows = [
@@ -405,19 +405,82 @@ class DrawingLinkTests(unittest.TestCase):
         elements = [
             {
                 "id": "4" * 24,
-                "name": "Manufacturing drawing",
-                "partNumber": "P-190B-260100",
+                "name": "Right Support Plate Drawing 1",
                 "elementType": "DRAWING",
             }
         ]
+        metadata = {
+            "properties": [
+                {"name": "Name", "value": "Right Support Plate Drawing 1"},
+                {"name": "Part number", "value": "P-190B-260100"},
+            ]
+        }
 
-        with patch.object(MODULE, "fetch_document_elements", return_value=elements):
+        with patch.object(
+            MODULE, "fetch_document_elements", return_value=elements
+        ), patch.object(
+            MODULE, "fetch_element_metadata", return_value=metadata
+        ) as fetch_metadata:
             drawing_urls, warnings = MODULE.drawing_urls_for_parts(
                 rows, ["P-190B-26"], "https://frc190.onshape.com"
             )
 
         self.assertIn("P-190B-260100", drawing_urls)
         self.assertEqual(warnings, [])
+        fetch_metadata.assert_called_once_with(
+            MODULE.OnshapeDocumentReference(
+                "https://frc190.onshape.com", part_did, "v", part_vid
+            ),
+            "4" * 24,
+        )
+
+    def test_released_assembly_document_is_also_scanned_for_drawings(self):
+        released_reference = MODULE.OnshapeDocumentReference(
+            "https://frc190.onshape.com", "3" * 24, "v", "4" * 24
+        )
+        drawing_eid = "5" * 24
+        rows = [
+            {
+                "partNumber": "P-190B-260764",
+                "itemSource": None,
+            }
+        ]
+
+        def elements_for(reference):
+            if reference == released_reference:
+                return [
+                    {
+                        "id": drawing_eid,
+                        "name": "Right Support Plate Drawing 1",
+                        "elementType": "DRAWING",
+                    }
+                ]
+            return []
+
+        with patch.object(
+            MODULE, "fetch_document_elements", side_effect=elements_for
+        ), patch.object(
+            MODULE,
+            "fetch_element_metadata",
+            return_value={
+                "properties": [
+                    {"name": "Part number", "value": "P-190B-260764"}
+                ]
+            },
+        ):
+            drawing_urls, warnings = MODULE.drawing_urls_for_parts(
+                rows,
+                ["P-190B-26"],
+                "https://frc190.onshape.com",
+                [released_reference],
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            drawing_urls["P-190B-260764"],
+            f"https://frc190.onshape.com/documents/{released_reference.did}/"
+            f"v/{released_reference.wvm_id}/e/{drawing_eid}",
+        )
 
     def test_multiple_matching_drawings_warn_and_leave_link_blank(self):
         part_did = "1" * 24
