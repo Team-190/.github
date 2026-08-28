@@ -45,6 +45,7 @@ Field names are API contracts and must match the names below exactly.
 - `Revision` — text
 - `Onshape State` — text
 - `Category` — text
+- `Onshape Drawing` — URL; immutable released-version drawing link
 - `Active` — boolean
 - `Last Synced At` — date with time
 
@@ -60,6 +61,7 @@ value before the first sync, including `SELECT VALUE:` during migration.
 - `Required Quantity` — number
 - `BOM Positions` — long text
 - `Onshape Source` — URL
+- `Drawing` — lookup of `Onshape Drawing` through `Part`
 - `Status` — single select; default `Needs Drawing`
 - `Machine` — single select
 - `Machinist` — text

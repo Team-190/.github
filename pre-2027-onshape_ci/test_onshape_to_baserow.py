@@ -276,6 +276,17 @@ class ReleaseResolutionTests(unittest.TestCase):
             ), patch.object(
                 MODULE, "onshape_get_json", return_value=v16_bom_response()
             ), patch.object(
+                MODULE,
+                "drawing_urls_for_parts",
+                return_value=(
+                    {
+                        "P-190B-260100": (
+                            "https://cad.onshape.com/documents/drawing/v/version/e/element"
+                        )
+                    },
+                    [],
+                ),
+            ), patch.object(
                 MODULE, "sync_to_baserow", side_effect=AssertionError("Baserow called")
             ):
                 MODULE.run_sync(
@@ -291,6 +302,10 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(saved["parts"][0]["Revision"], "C")
         self.assertEqual(saved["parts"][0]["Onshape State"], "RELEASED")
         self.assertEqual(saved["parts"][0]["Material"], "Aluminum - 6061")
+        self.assertEqual(
+            saved["parts"][0]["Onshape Drawing"],
+            "https://cad.onshape.com/documents/drawing/v/version/e/element",
+        )
         self.assertEqual(len(saved["requirements"]), 1)
         self.assertEqual(saved["requirements"][0]["assembly_number"], "A-190B-260001")
         self.assertEqual(saved["requirements"][0]["Configuration"], "width=0.5+meter")
@@ -316,6 +331,8 @@ class ReleaseResolutionTests(unittest.TestCase):
             with patch.object(
                 MODULE, "resolve_latest_released_assembly", return_value=released
             ), patch.object(MODULE, "fetch_bom", return_value=rows), patch.object(
+                MODULE, "drawing_urls_for_parts", return_value=({}, [])
+            ), patch.object(
                 MODULE, "sync_to_baserow", side_effect=AssertionError("Baserow called")
             ):
                 result = MODULE.run_sync(
@@ -327,6 +344,107 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(saved["source_revision"]["version_id"], VID_B)
         self.assertEqual(saved["parts"][0]["Revision"], "C")
         self.assertEqual(saved["requirements"][0]["Required Quantity"], 2)
+
+
+class DrawingLinkTests(unittest.TestCase):
+    def test_document_elements_are_cached_per_released_document_version(self):
+        part_did = "1" * 24
+        part_vid = "2" * 24
+        drawing_eid = "4" * 24
+        item_source = {
+            "documentId": part_did,
+            "wvmType": "v",
+            "wvmId": part_vid,
+            "viewHref": (
+                f"https://cad.onshape.com/documents/{part_did}/v/{part_vid}/e/"
+                f"{'3' * 24}"
+            ),
+        }
+        rows = [
+            {
+                "partNumber": "P-190B-260100",
+                "itemSource": item_source,
+            },
+            {
+                "partNumber": "P-190B-260100",
+                "itemSource": {**item_source, "configuration": "Length=2+inch"},
+            },
+        ]
+        elements = [
+            {"id": "5" * 24, "name": "Part Studio 1", "elementType": "PARTSTUDIO"},
+            {"id": drawing_eid, "name": "p-190b-260100", "elementType": "DRAWING"},
+        ]
+
+        with patch.object(
+            MODULE, "fetch_document_elements", return_value=elements
+        ) as fetch_elements:
+            drawing_urls, warnings = MODULE.drawing_urls_for_parts(
+                rows, ["P-190B-26"], "https://cad.onshape.com"
+            )
+
+        self.assertEqual(fetch_elements.call_count, 1)
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            drawing_urls["P-190B-260100"],
+            f"https://cad.onshape.com/documents/{part_did}/v/{part_vid}/e/{drawing_eid}",
+        )
+
+    def test_element_part_number_can_match_when_tab_name_does_not(self):
+        part_did = "1" * 24
+        part_vid = "2" * 24
+        rows = [
+            {
+                "partNumber": "P-190B-260100",
+                "itemSource": {
+                    "documentId": part_did,
+                    "wvmType": "v",
+                    "wvmId": part_vid,
+                },
+            }
+        ]
+        elements = [
+            {
+                "id": "4" * 24,
+                "name": "Manufacturing drawing",
+                "partNumber": "P-190B-260100",
+                "elementType": "DRAWING",
+            }
+        ]
+
+        with patch.object(MODULE, "fetch_document_elements", return_value=elements):
+            drawing_urls, warnings = MODULE.drawing_urls_for_parts(
+                rows, ["P-190B-26"], "https://frc190.onshape.com"
+            )
+
+        self.assertIn("P-190B-260100", drawing_urls)
+        self.assertEqual(warnings, [])
+
+    def test_multiple_matching_drawings_warn_and_leave_link_blank(self):
+        part_did = "1" * 24
+        part_vid = "2" * 24
+        rows = [
+            {
+                "partNumber": "P-190B-260100",
+                "itemSource": {
+                    "documentId": part_did,
+                    "wvmType": "v",
+                    "wvmId": part_vid,
+                },
+            }
+        ]
+        elements = [
+            {"id": "3" * 24, "name": "P-190B-260100", "elementType": "DRAWING"},
+            {"id": "4" * 24, "name": "P-190B-260100", "elementType": "DRAWING"},
+        ]
+
+        with patch.object(MODULE, "fetch_document_elements", return_value=elements):
+            drawing_urls, warnings = MODULE.drawing_urls_for_parts(
+                rows, ["P-190B-26"], "https://cad.onshape.com"
+            )
+
+        self.assertNotIn("P-190B-260100", drawing_urls)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Multiple released drawings", warnings[0])
 
 
 class RecordBuildingTests(unittest.TestCase):

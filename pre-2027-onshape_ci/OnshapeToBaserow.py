@@ -40,6 +40,14 @@ class OnshapeTarget:
 
 
 @dataclass(frozen=True)
+class OnshapeDocumentReference:
+    base_url: str
+    did: str
+    wvm_type: str
+    wvm_id: str
+
+
+@dataclass(frozen=True)
 class ReleasedAssembly:
     document_id: str
     element_id: str
@@ -146,6 +154,15 @@ def onshape_get_json(url: str) -> dict:
     payload = response.json()
     if not isinstance(payload, dict):
         raise RuntimeError(f"Unexpected Onshape response from {url}: expected an object")
+    return payload
+
+
+def onshape_get_json_list(url: str) -> list:
+    response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Unexpected Onshape response from {url}: expected an array")
     return payload
 
 
@@ -389,6 +406,116 @@ def source_url_and_configuration(value) -> tuple[str, str]:
     return url, configuration or "default"
 
 
+def source_document_reference(
+    value, default_base_url: str
+) -> OnshapeDocumentReference | None:
+    if isinstance(value, dict):
+        url = str(value.get("viewHref") or value.get("href") or "").strip()
+        did = str(value.get("documentId") or "").strip()
+        wvm_type = str(value.get("wvmType") or "").strip().lower()
+        wvm_id = str(value.get("wvmId") or "").strip()
+    else:
+        url = str(value or "").strip()
+        did = ""
+        wvm_type = ""
+        wvm_id = ""
+
+    parsed = urlparse(url)
+    base_url = (
+        f"{parsed.scheme}://{parsed.netloc}"
+        if parsed.scheme and parsed.netloc
+        else default_base_url.rstrip("/")
+    )
+    match = re.search(
+        r"/documents/([a-fA-F0-9]+)/([wvm])/([a-fA-F0-9]+)/e/",
+        parsed.path,
+    )
+    if match:
+        url_did, url_wvm_type, url_wvm_id = match.groups()
+        did = did or url_did
+        wvm_type = wvm_type or url_wvm_type
+        wvm_id = wvm_id or url_wvm_id
+
+    if not did or wvm_type not in ("w", "v", "m") or not wvm_id:
+        return None
+    return OnshapeDocumentReference(base_url, did, wvm_type, wvm_id)
+
+
+def fetch_document_elements(reference: OnshapeDocumentReference) -> list[dict]:
+    endpoint = (
+        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/documents/d/"
+        f"{reference.did}/{reference.wvm_type}/{reference.wvm_id}/elements"
+    )
+    elements = onshape_get_json_list(endpoint)
+    if not all(isinstance(element, dict) for element in elements):
+        raise RuntimeError(
+            f"Unexpected Onshape elements response for document {reference.did}"
+        )
+    return elements
+
+
+def normalized_part_number(value) -> str:
+    return str(value or "").strip().casefold()
+
+
+def is_drawing_element(element: dict) -> bool:
+    return str(
+        element.get("elementType") or element.get("type") or ""
+    ).strip().casefold() == "drawing"
+
+
+def drawing_urls_for_parts(
+    items: list[dict], prefixes: list[str], default_base_url: str
+) -> tuple[dict[str, str], list[str]]:
+    """Find released drawing tabs whose name or part number matches a BOM part."""
+    expected_by_reference: dict[OnshapeDocumentReference, dict[str, str]] = {}
+    for row in items:
+        part_number = str(row.get("partNumber") or "").strip()
+        if not part_number or (
+            prefixes and not any(part_number.startswith(prefix) for prefix in prefixes)
+        ):
+            continue
+        reference = source_document_reference(row.get("itemSource"), default_base_url)
+        if reference is None:
+            continue
+        expected_by_reference.setdefault(reference, {})[
+            normalized_part_number(part_number)
+        ] = part_number
+
+    matches: dict[str, set[str]] = {}
+    for reference, expected in expected_by_reference.items():
+        for element in fetch_document_elements(reference):
+            if not is_drawing_element(element):
+                continue
+            element_id = str(element.get("id") or element.get("elementId") or "").strip()
+            if not element_id:
+                continue
+            candidate_keys = {
+                normalized_part_number(element.get("name")),
+                normalized_part_number(element.get("partNumber")),
+            }
+            for candidate_key in candidate_keys - {""}:
+                part_number = expected.get(candidate_key)
+                if not part_number:
+                    continue
+                url = (
+                    f"{reference.base_url}/documents/{reference.did}/"
+                    f"{reference.wvm_type}/{reference.wvm_id}/e/{element_id}"
+                )
+                matches.setdefault(part_number, set()).add(url)
+
+    drawing_urls: dict[str, str] = {}
+    warnings: list[str] = []
+    for part_number, urls in sorted(matches.items()):
+        if len(urls) == 1:
+            drawing_urls[part_number] = next(iter(urls))
+        else:
+            warnings.append(
+                f"Multiple released drawings match {part_number}; drawing link left blank"
+            )
+    return drawing_urls, warnings
+
+
 def decimal_quantity(value) -> Decimal:
     try:
         return Decimal(str(value or "0"))
@@ -555,7 +682,7 @@ def sync_to_baserow(parts: list[dict], requirements: list[dict], warnings: list[
 
         for part in parts:
             part["Last Synced At"] = now
-        part_fields = ("Name", "Description", "Material", "Manufacturing Method", "Vendor", "Revision", "Onshape State", "Category", "Active")
+        part_fields = ("Name", "Description", "Material", "Manufacturing Method", "Vendor", "Revision", "Onshape State", "Category", "Onshape Drawing", "Active")
         upsert_table(client, table_ids["parts"], "Part Number", parts, part_fields)
         part_rows = client.list_rows(table_ids["parts"])
         part_ids = {str(r.get("Part Number") or ""): r["id"] for r in part_rows}
@@ -634,6 +761,12 @@ def run_sync(
     released_target = released.bom_target(target.base_url)
     raw_items = fetch_bom(released_target)
     parts, requirements, warnings = build_records(raw_items, prefixes)
+    drawing_urls, drawing_warnings = drawing_urls_for_parts(
+        raw_items, prefixes, target.base_url
+    )
+    for part in parts:
+        part["Onshape Drawing"] = drawing_urls.get(part["Part Number"], "")
+    warnings = sorted(set(warnings + drawing_warnings))
     print(
         "Released assembly "
         f"part={released.part_number or '(none)'} "
