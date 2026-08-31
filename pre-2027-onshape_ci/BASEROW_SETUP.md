@@ -4,14 +4,26 @@ The sync writes only engineering-owned fields. It never updates manufacturing
 status, machine, machinist, finishing, current location, QC outcome, or
 disposition on an existing production requirement.
 
-`ONSHAPE_DOC_URL` must point to the tracked top-level assembly tab in Main. The
-sync reads that element's Part number metadata, asks Onshape for the latest
-assembly revision of that part number (`et=1`), and reads the multilevel BOM from
-the document, version, element, and configuration returned by the revision. The
-Main URL's configuration query is not used to filter revisions because Onshape
-can omit it for a configured assembly. Child parts are not independently
-upgraded: the part revisions captured by the released top-level assembly are the
-production baseline.
+`ONSHAPE_DOC_URL` points to the master assembly tab in Main.
+`ONSHAPE_MANUFACTURING_ROOT_URLS` contains the independently releasable
+subassembly tabs whose latest released BOMs drive production. Store it as a JSON
+array of Main workspace URLs, for example:
+
+```json
+[
+  "https://frc190.onshape.com/documents/.../w/.../e/...",
+  "https://frc190.onshape.com/documents/.../w/.../e/..."
+]
+```
+
+For every manufacturing root, the sync reads its Part number, resolves its
+latest assembly revision (`et=1`), and reads that revision's immutable
+document/version/element/configuration coordinates. Direct child parts are
+assigned to the root assembly even though Onshape omits the top-level BOM row.
+The master BOM does not create production requirements; it only records which
+subassembly revisions have been incorporated into the released integration
+baseline. If `ONSHAPE_MANUFACTURING_ROOT_URLS` is empty, the sync retains the
+legacy single-root behavior and uses `ONSHAPE_DOC_URL` as the production root.
 
 ## Required tables
 
@@ -32,6 +44,12 @@ Field names are API contracts and must match the names below exactly.
 - `Assembly Number` — primary text
 - `Subsystem Name` — text
 - `Active` — boolean
+- `Latest Released Revision` — text
+- `Master Baseline Revision` — text
+- `Integration Status` — single select or text; `Not Compared`, `Not in Master`,
+  `Current in Master`, and `Newer Revision Available`
+- `Onshape Source` — URL; immutable released assembly link
+- `Last Synced At` — date with time
 - `Notes` — long text
 
 ### Parts
@@ -43,7 +61,7 @@ Field names are API contracts and must match the names below exactly.
 - `Manufacturing Method` — single select or text
 - `Vendor` — text
 - `Revision` — text
-- `Onshape State` — text
+- `OnShape Text` — text
 - `Category` — text
 - `Onshape Drawing` — URL; immutable released-version drawing link
 - `Active` — boolean
@@ -57,6 +75,9 @@ value before the first sync, including `SELECT VALUE:` during migration.
 - `Production Key` — primary text
 - `Part` — link to one Parts row
 - `Assembly` — link to one Assemblies row
+- `Source Root` — text; independently synchronized manufacturing root
+- `Source Assembly Revision` — text; immutable released root revision
+- `Required Part Revision` — text; part revision captured by that root release
 - `Configuration` — long text
 - `Required Quantity` — number
 - `BOM Positions` — long text
@@ -108,6 +129,19 @@ For Baserow Cloud, no repository variable is necessary. For self-hosting, add a
 repository Actions variable named `BASEROW_API_URL`, for example
 `https://baserow.example.org/api`.
 
+Create these repository Actions secrets:
+
+- `ONSHAPE_DOC_URL_DELTA` and `ONSHAPE_DOC_URL_EPSILON` — master assembly Main
+  URLs, retained as the integration baselines.
+- `ONSHAPE_MANUFACTURING_ROOT_URLS_DELTA` and
+  `ONSHAPE_MANUFACTURING_ROOT_URLS_EPSILON` — JSON arrays of independently
+  released manufacturing-root Main URLs.
+
+Do not configure overlapping manufacturing roots unless duplicated production
+requirements are intentional. For example, do not track both a complete arm
+assembly and one of its nested assemblies as production roots if both expanded
+BOMs contain the same fabricated parts.
+
 ## Validation and cutover
 
 Both Baserow workflows have a manual `dry_run` input. A dry run requires the
@@ -126,10 +160,12 @@ gh workflow run onshape_baserow_delta.yml --ref <implementation-branch> -f dry_r
 gh workflow run onshape_baserow_poot_horse.yml --ref <implementation-branch> -f dry_run=true
 ```
 
-The optional manual `onshape_doc_url` input replaces the workflow's document
-secret for either a dry run or a production run dispatched from the default
-branch. Scheduled and repository-dispatch runs always use the secret. This makes
-it possible to treat any assembly tab as the tracked root for a diagnostic run.
+The optional manual `onshape_doc_url` input replaces the manufacturing-root
+list with one assembly for either a dry run or a production run dispatched from
+the default branch. The configured master remains the comparison baseline.
+Scheduled and repository-dispatch runs always use the manufacturing-root list
+secret. This makes it possible to treat any assembly tab as the tracked root for
+a diagnostic run.
 For example, to validate release resolution using A-26C-0004 while leaving the
 poot_horse production URL intact:
 
@@ -144,8 +180,9 @@ The workflow files already exist on the default branch, which permits
 `workflow_dispatch` to select the implementation branch's version. Selecting
 `dry_run=false` on a non-default branch runs neither job, so it cannot start a
 production Baserow sync. A production override on the default branch writes the
-selected assembly's latest released BOM to Baserow, so validate the same URL in
-a dry run first.
+selected manufacturing root's latest released BOM and deactivates only older
+requirements belonging to that same root, so validate the same URL in a dry run
+first.
 
 After validation, dispatch the production override from the default branch:
 
@@ -165,8 +202,9 @@ python pre-2027-onshape_ci/OnshapeToBaserow.py --dry-run --output-json bom-dry-r
 
 1. Keep the existing Google Sheets workflow enabled.
 2. Run `Sync Onshape Delta BOM to Baserow` manually with `dry_run` enabled.
-3. Verify the source revision/version and compare source counts, aggregated
-   quantities, configurations, part revisions, and warnings.
+3. Verify every source revision/version, root-scoped production key, master
+   baseline comparison, source count, aggregated quantity, configuration, part
+   revision, and warning.
 4. Resolve any missing single-select choices or field-name mismatches.
 5. Run the workflow without `dry_run`, then let both workflows run in parallel
    before removing Data Fetcher and Sheets.
