@@ -43,9 +43,13 @@ Field names are API contracts and must match the names below exactly.
 - `Manufacturing Method` — single select or text
 - `Vendor` — text
 - `Revision` — text
-- `Onshape State` — text
+- `OnShape Text` — text
 - `Category` — text
 - `Onshape Drawing` — URL; immutable released-version drawing link
+- `Drawing PDF` — file; exported PDF for the matching released drawing
+- `STEP File` — file; AP242 STEP export(s) for the configured part
+- `Drawing PDF Export Key` — text; internal cache key
+- `STEP Export Key` — text; internal cache key
 - `Active` — boolean
 - `Last Synced At` — date with time
 
@@ -62,6 +66,8 @@ value before the first sync, including `SELECT VALUE:` during migration.
 - `BOM Positions` — long text
 - `Onshape Source` — URL
 - `Drawing` — lookup of `Onshape Drawing` through `Part`
+- `Drawing PDF` — lookup of `Drawing PDF` through `Part`
+- `STEP File` — lookup of `STEP File` through `Part`
 - `Status` — single select; default `Needs Drawing`
 - `Machine` — single select
 - `Machinist` — text
@@ -103,6 +109,8 @@ Status choices:
 Create a database token with read, create, and update access to Assemblies,
 Parts, Production Requirements, and Sync Runs. Add it to the GitHub repository
 as an Actions secret named `BASEROW_TOKEN`. Do not commit or paste the token.
+The poot-horse workflow also uses this token to upload PDF and STEP files to
+Baserow before attaching them to Parts rows.
 
 For Baserow Cloud, no repository variable is necessary. For self-hosting, add a
 repository Actions variable named `BASEROW_API_URL`, for example
@@ -115,7 +123,9 @@ Onshape URL and Onshape API credentials, but no Baserow credentials. It performs
 release and BOM resolution, builds all records, skips every Baserow API call,
 and uploads `onshape-baserow-dry-run.json` as a workflow artifact. The dry-run
 job is separate from the production job and is not given the Baserow URL, token,
-or table IDs. Manual production syncs are restricted to the default branch;
+or table IDs. When `SYNC_CAD_FILES=true`, the dry-run artifact lists the planned
+PDF and STEP filenames but does not start Onshape translations or upload files.
+Manual production syncs are restricted to the default branch;
 scheduled and repository-dispatch production syncs are unchanged.
 
 To test an implementation branch before merging, push the branch to this

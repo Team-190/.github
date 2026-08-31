@@ -300,7 +300,7 @@ class ReleaseResolutionTests(unittest.TestCase):
             ["P-190B-260100"],
         )
         self.assertEqual(saved["parts"][0]["Revision"], "C")
-        self.assertEqual(saved["parts"][0]["Onshape State"], "RELEASED")
+        self.assertEqual(saved["parts"][0]["OnShape Text"], "RELEASED")
         self.assertEqual(saved["parts"][0]["Material"], "Aluminum - 6061")
         self.assertEqual(
             saved["parts"][0]["Onshape Drawing"],
@@ -481,6 +481,194 @@ class DrawingLinkTests(unittest.TestCase):
             drawing_urls["P-190B-260764"],
             f"https://frc190.onshape.com/documents/{released_reference.did}/"
             f"v/{released_reference.wvm_id}/e/{drawing_eid}",
+        )
+
+
+class CadAttachmentTests(unittest.TestCase):
+    def part_reference(self, configuration="default"):
+        return MODULE.OnshapePartReference(
+            "https://cad.onshape.com",
+            "1" * 24,
+            "v",
+            "2" * 24,
+            "3" * 24,
+            "JHD",
+            configuration,
+        )
+
+    def test_part_export_references_keep_each_configuration(self):
+        rows = []
+        for configuration in ("Length=1+meter", "Length=2+meter"):
+            rows.append(
+                {
+                    "partNumber": "P-190B-260100",
+                    "itemSource": {
+                        "documentId": "1" * 24,
+                        "wvmType": "v",
+                        "wvmId": "2" * 24,
+                        "elementId": "3" * 24,
+                        "partId": "JHD",
+                        "configuration": configuration,
+                    },
+                }
+            )
+
+        references, warnings = MODULE.part_export_references(
+            rows, ["P-190B-26"], "https://cad.onshape.com"
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            {reference.configuration for reference in references["P-190B-260100"]},
+            {"Length=1+meter", "Length=2+meter"},
+        )
+
+    def test_drawing_pdf_export_downloads_external_data(self):
+        drawing_url = (
+            f"https://cad.onshape.com/documents/{'1' * 24}/v/{'2' * 24}/e/"
+            f"{'3' * 24}"
+        )
+        translation = {
+            "id": "translation-id",
+            "requestState": "DONE",
+            "resultExternalDataIds": ["foreign-id"],
+        }
+        with patch.object(
+            MODULE, "onshape_post_json", return_value=translation
+        ) as post_json, patch.object(
+            MODULE, "onshape_get_bytes", return_value=b"pdf"
+        ) as get_bytes:
+            content = MODULE.export_drawing_pdf(drawing_url)
+
+        self.assertEqual(content, b"pdf")
+        self.assertIn("/drawings/d/", post_json.call_args.args[0])
+        self.assertEqual(post_json.call_args.args[1]["formatName"], "PDF")
+        self.assertIn("/externaldata/foreign-id", get_bytes.call_args.args[0])
+
+    def test_step_export_selects_part_configuration_and_ap242(self):
+        reference = self.part_reference("Length=2+meter")
+        translation = {
+            "id": "translation-id",
+            "requestState": "DONE",
+            "resultExternalDataIds": ["foreign-id"],
+        }
+        with patch.object(
+            MODULE, "onshape_post_json", return_value=translation
+        ) as post_json, patch.object(
+            MODULE, "onshape_get_bytes", return_value=b"step"
+        ):
+            content = MODULE.export_part_step(reference)
+
+        self.assertEqual(content, b"step")
+        endpoint, body = post_json.call_args.args
+        self.assertIn("/partstudios/d/", endpoint)
+        self.assertEqual(body["partIds"], "JHD")
+        self.assertEqual(body["configuration"], "Length%3D2%2Bmeter")
+        self.assertEqual(body["stepVersionString"], "AP242")
+        self.assertFalse(body["storeInDocument"])
+
+    def test_matching_export_keys_reuse_existing_files(self):
+        reference = self.part_reference()
+        drawing_url = (
+            f"https://cad.onshape.com/documents/{'4' * 24}/v/{'5' * 24}/e/"
+            f"{'6' * 24}"
+        )
+        existing = {
+            "Part Number": "P-190B-260100",
+            "Drawing PDF": [{"name": "existing.pdf", "size": 12}],
+            "Drawing PDF Export Key": MODULE.drawing_export_key(drawing_url),
+            "STEP File": [{"name": "existing.step", "size": 34}],
+            "STEP Export Key": MODULE.step_export_key([reference]),
+        }
+        client = types.SimpleNamespace(
+            upload_file=lambda *args: self.fail("cached file was uploaded again")
+        )
+        parts = [{"Part Number": "P-190B-260100"}]
+        with patch.object(
+            MODULE, "export_drawing_pdf", side_effect=AssertionError("PDF exported")
+        ), patch.object(
+            MODULE, "export_part_step", side_effect=AssertionError("STEP exported")
+        ):
+            MODULE.prepare_cad_attachments(
+                client,
+                parts,
+                {"P-190B-260100": existing},
+                {"P-190B-260100": drawing_url},
+                {"P-190B-260100": [reference]},
+                [],
+            )
+
+        self.assertEqual(parts[0]["Drawing PDF"], [{"name": "existing.pdf"}])
+        self.assertEqual(parts[0]["STEP File"], [{"name": "existing.step"}])
+
+    def test_failed_export_preserves_existing_attachment(self):
+        reference = self.part_reference("Length=changed")
+        existing = {
+            "Part Number": "P-190B-260100",
+            "STEP File": [{"name": "last-good.step"}],
+            "STEP Export Key": "old-key",
+        }
+        parts = [{"Part Number": "P-190B-260100"}]
+        warnings = []
+        with patch.object(
+            MODULE, "export_part_step", side_effect=RuntimeError("translation failed")
+        ):
+            MODULE.prepare_cad_attachments(
+                types.SimpleNamespace(upload_file=lambda *args: {}),
+                parts,
+                {"P-190B-260100": existing},
+                {},
+                {"P-190B-260100": [reference]},
+                warnings,
+            )
+
+        self.assertEqual(parts[0]["STEP File"], [{"name": "last-good.step"}])
+        self.assertEqual(parts[0]["STEP Export Key"], "old-key")
+        self.assertIn("translation failed", warnings[0])
+
+    def test_cad_dry_run_only_reports_planned_files(self):
+        released = MODULE.released_assembly_from_revision(revision("B", VID_B))
+        reference = self.part_reference("Length=2+meter")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "dry-run.json"
+            with patch.object(
+                MODULE, "resolve_latest_released_assembly", return_value=released
+            ), patch.object(
+                MODULE, "fetch_bom", return_value=MODULE.normalize_bom_rows(
+                    v16_bom_response()["headers"], v16_bom_response()["rows"]
+                )
+            ), patch.object(
+                MODULE,
+                "drawing_urls_for_parts",
+                return_value=(
+                    {"P-190B-260100": "https://cad.onshape.com/documents/d/v/v/e/e"},
+                    [],
+                ),
+            ), patch.object(
+                MODULE,
+                "part_export_references",
+                return_value=({"P-190B-260100": [reference]}, []),
+            ), patch.object(
+                MODULE, "export_part_step", side_effect=AssertionError("STEP exported")
+            ), patch.object(
+                MODULE, "export_drawing_pdf", side_effect=AssertionError("PDF exported")
+            ):
+                MODULE.run_sync(
+                    target(),
+                    ["P-190B-26"],
+                    dry_run=True,
+                    output_json=str(output),
+                    sync_cad_files=True,
+                )
+            saved = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            saved["cad_files"]["P-190B-260100"]["drawing_pdf"],
+            "P-190B-260100.pdf",
+        )
+        self.assertEqual(
+            saved["cad_files"]["P-190B-260100"]["step_files"],
+            ["P-190B-260100.step"],
         )
 
     def test_multiple_matching_drawings_warn_and_leave_link_blank(self):

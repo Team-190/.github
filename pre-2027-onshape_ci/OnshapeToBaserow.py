@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -27,6 +28,8 @@ ASSEMBLY_NAME_RE = re.compile(r"^A-[A-Za-z0-9-]+$")
 BATCH_SIZE = 100
 ONSHAPE_API_VERSION = "v16"
 ASSEMBLY_ELEMENT_TYPE = 1
+CAD_EXPORT_CACHE_VERSION = "v1"
+TRANSLATION_TIMEOUT_SECONDS = 180
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,31 @@ class OnshapeDocumentReference:
     did: str
     wvm_type: str
     wvm_id: str
+
+
+@dataclass(frozen=True)
+class OnshapePartReference:
+    base_url: str
+    did: str
+    wvm_type: str
+    wvm_id: str
+    eid: str
+    part_id: str
+    configuration: str
+
+    def cache_value(self) -> str:
+        return "|".join(
+            (
+                CAD_EXPORT_CACHE_VERSION,
+                self.base_url.rstrip("/"),
+                self.did,
+                self.wvm_type,
+                self.wvm_id,
+                self.eid,
+                self.part_id,
+                self.configuration,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -164,6 +192,77 @@ def onshape_get_json_list(url: str) -> list:
     if not isinstance(payload, list):
         raise RuntimeError(f"Unexpected Onshape response from {url}: expected an array")
     return payload
+
+
+def onshape_post_json(url: str, body: dict) -> dict:
+    response = requests.post(
+        url,
+        headers=onshape_headers("POST", url),
+        json=body,
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected Onshape response from {url}: expected an object")
+    return payload
+
+
+def onshape_get_bytes(url: str) -> bytes:
+    headers = onshape_headers("GET", url)
+    headers["Accept"] = "application/octet-stream"
+    response = requests.get(url, headers=headers, timeout=120)
+    response.raise_for_status()
+    return response.content
+
+
+def poll_translation(base_url: str, translation: dict) -> dict:
+    translation_id = str(translation.get("id") or "").strip()
+    if not translation_id:
+        raise RuntimeError("Onshape translation response has no translation ID")
+    endpoint = (
+        f"{base_url.rstrip('/')}/api/{ONSHAPE_API_VERSION}/translations/"
+        f"{quote(translation_id, safe='')}"
+    )
+    deadline = time.monotonic() + TRANSLATION_TIMEOUT_SECONDS
+    delay = 1.0
+    current = translation
+    while True:
+        state = str(current.get("requestState") or "").strip().upper()
+        if state == "DONE":
+            return current
+        if state == "FAILED":
+            reason = str(current.get("failureReason") or "unknown reason").strip()
+            raise RuntimeError(f"Onshape translation failed: {reason}")
+        if state not in ("", "ACTIVE"):
+            raise RuntimeError(f"Unexpected Onshape translation state: {state}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Onshape translation {translation_id} did not finish within "
+                f"{TRANSLATION_TIMEOUT_SECONDS} seconds"
+            )
+        time.sleep(delay)
+        current = onshape_get_json(endpoint)
+        delay = min(delay * 2, 8.0)
+
+
+def download_translation(base_url: str, document_id: str, translation: dict) -> bytes:
+    completed = poll_translation(base_url, translation)
+    external_ids = completed.get("resultExternalDataIds") or []
+    if isinstance(external_ids, str):
+        external_ids = [external_ids]
+    if not isinstance(external_ids, list) or len(external_ids) != 1:
+        raise RuntimeError(
+            "Onshape translation did not produce exactly one external data file"
+        )
+    foreign_id = str(external_ids[0] or "").strip()
+    if not foreign_id:
+        raise RuntimeError("Onshape translation returned an empty external data ID")
+    endpoint = (
+        f"{base_url.rstrip('/')}/api/{ONSHAPE_API_VERSION}/documents/d/"
+        f"{document_id}/externaldata/{quote(foreign_id, safe='')}"
+    )
+    return onshape_get_bytes(endpoint)
 
 
 def normalized_configuration(value) -> str:
@@ -441,6 +540,105 @@ def source_document_reference(
     return OnshapeDocumentReference(base_url, did, wvm_type, wvm_id)
 
 
+def part_export_references(
+    items: list[dict], prefixes: list[str], default_base_url: str
+) -> tuple[dict[str, list[OnshapePartReference]], list[str]]:
+    """Collect every configured Part Studio part represented by each part number."""
+    references: dict[str, set[OnshapePartReference]] = {}
+    warnings: list[str] = []
+    for row in items:
+        part_number = str(row.get("partNumber") or "").strip()
+        if not part_number or (
+            prefixes and not any(part_number.startswith(prefix) for prefix in prefixes)
+        ):
+            continue
+        source = row.get("itemSource")
+        document = source_document_reference(source, default_base_url)
+        if (
+            not isinstance(source, dict)
+            or document is None
+            or document.wvm_type not in ("w", "v")
+        ):
+            warnings.append(f"No STEP export source found for {part_number}")
+            continue
+        source_url, url_configuration = source_url_and_configuration(source)
+        element_id = str(source.get("elementId") or "").strip()
+        if not element_id:
+            match = re.search(r"/e/([a-fA-F0-9]+)", urlparse(source_url).path)
+            element_id = match.group(1) if match else ""
+        part_id = str(source.get("partId") or "").strip()
+        configuration = normalized_configuration(
+            source.get("configuration") or url_configuration
+        )
+        if not element_id or not part_id:
+            warnings.append(f"No STEP export source found for {part_number}")
+            continue
+        references.setdefault(part_number, set()).add(
+            OnshapePartReference(
+                document.base_url,
+                document.did,
+                document.wvm_type,
+                document.wvm_id,
+                element_id,
+                part_id,
+                configuration,
+            )
+        )
+    return {
+        part_number: sorted(values, key=lambda value: value.cache_value())
+        for part_number, values in references.items()
+    }, sorted(set(warnings))
+
+
+def drawing_export_key(drawing_url: str) -> str:
+    return f"{CAD_EXPORT_CACHE_VERSION}|pdf|{drawing_url}"
+
+
+def step_export_key(references: list[OnshapePartReference]) -> str:
+    value = "\n".join(reference.cache_value() for reference in references)
+    digest = hashlib.sha256(value.encode()).hexdigest()
+    return f"{CAD_EXPORT_CACHE_VERSION}|step|{digest}"
+
+
+def safe_export_filename(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-.")
+    return cleaned or "part"
+
+
+def export_drawing_pdf(drawing_url: str) -> bytes:
+    target = parse_onshape_doc_url(drawing_url)
+    if target.wvm_type not in ("w", "v"):
+        raise ValueError("Drawing exports require an Onshape workspace or version")
+    endpoint = (
+        f"{target.base_url}/api/{ONSHAPE_API_VERSION}/drawings/d/{target.did}/"
+        f"{target.wvm_type}/{target.wvm_id}/e/{target.eid}/translations"
+    )
+    translation = onshape_post_json(
+        endpoint,
+        {"formatName": "PDF", "storeInDocument": False},
+    )
+    return download_translation(target.base_url, target.did, translation)
+
+
+def export_part_step(reference: OnshapePartReference) -> bytes:
+    endpoint = (
+        f"{reference.base_url.rstrip('/')}/api/{ONSHAPE_API_VERSION}/partstudios/"
+        f"d/{reference.did}/{reference.wvm_type}/{reference.wvm_id}/e/"
+        f"{reference.eid}/translations"
+    )
+    translation = onshape_post_json(
+        endpoint,
+        {
+            "formatName": "STEP",
+            "storeInDocument": False,
+            "configuration": quote(reference.configuration, safe=""),
+            "partIds": reference.part_id,
+            "stepVersionString": "AP242",
+        },
+    )
+    return download_translation(reference.base_url, reference.did, translation)
+
+
 def fetch_document_elements(reference: OnshapeDocumentReference) -> list[dict]:
     endpoint = (
         f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/documents/d/"
@@ -593,7 +791,7 @@ def build_records(items: list[dict], prefixes: list[str]):
             "Manufacturing Method": str(row.get("manufacturingmethod") or "").strip(),
             "Vendor": str(row.get("vendor") or "").strip(),
             "Revision": str(row.get("revision") or "").strip(),
-            "Onshape State": str(row.get("state") or "").strip(),
+            "OnShape Text": str(row.get("state") or "").strip(),
             "Category": str(row.get("category") or "").strip(),
             "Active": True,
         }
@@ -632,7 +830,7 @@ class BaserowClient:
     def __init__(self, base_url: str, token: str):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"Token {token}", "Content-Type": "application/json"})
+        self.session.headers.update({"Authorization": f"Token {token}"})
 
     def _url(self, table_id: int, suffix: str = "") -> str:
         return f"{self.base_url}/database/rows/table/{table_id}/{suffix}?user_field_names=true"
@@ -675,10 +873,28 @@ class BaserowClient:
             updated.extend(response.json().get("items", []))
         return updated
 
+    def upload_file(self, filename: str, content: bytes, content_type: str) -> dict:
+        response = self.session.post(
+            f"{self.base_url}/user-files/upload-file/",
+            files={"file": (filename, content, content_type)},
+            timeout=120,
+        )
+        response.raise_for_status()
+        uploaded = response.json()
+        if not isinstance(uploaded, dict) or not uploaded.get("name"):
+            raise RuntimeError("Baserow file upload response has no file name")
+        return uploaded
+
 
 def comparable(value):
     if isinstance(value, list):
-        return sorted(x.get("id", x) if isinstance(x, dict) else x for x in value)
+        normalized = []
+        for item in value:
+            if isinstance(item, dict):
+                normalized.append(item.get("id") or item.get("name") or item)
+            else:
+                normalized.append(item)
+        return sorted(normalized, key=str)
     return value if value is not None else ""
 
 
@@ -708,7 +924,148 @@ def upsert_table(
     return len(created), len(updated), len(desired) - len(creates) - len(updates)
 
 
-def sync_to_baserow(parts: list[dict], requirements: list[dict], warnings: list[str], source_rows: int) -> dict:
+def baserow_file_references(value) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        {"name": str(item["name"])}
+        for item in value
+        if isinstance(item, dict) and item.get("name")
+    ]
+
+
+def step_filename(
+    part_number: str, reference: OnshapePartReference, reference_count: int
+) -> str:
+    stem = safe_export_filename(part_number)
+    if reference_count == 1:
+        return f"{stem}.step"
+    suffix = hashlib.sha256(reference.cache_value().encode()).hexdigest()[:10]
+    return f"{stem}-{suffix}.step"
+
+
+def planned_cad_files(
+    parts: list[dict],
+    drawing_urls: dict[str, str],
+    part_references: dict[str, list[OnshapePartReference]],
+) -> dict[str, dict]:
+    planned = {}
+    for part in parts:
+        part_number = part["Part Number"]
+        references = part_references.get(part_number, [])
+        planned[part_number] = {
+            "drawing_pdf": (
+                f"{safe_export_filename(part_number)}.pdf"
+                if drawing_urls.get(part_number)
+                else None
+            ),
+            "step_files": [
+                step_filename(part_number, reference, len(references))
+                for reference in references
+            ],
+        }
+    return planned
+
+
+def prepare_cad_attachments(
+    client: BaserowClient,
+    parts: list[dict],
+    existing_by_number: dict[str, dict],
+    drawing_urls: dict[str, str],
+    part_references: dict[str, list[OnshapePartReference]],
+    warnings: list[str],
+) -> None:
+    """Export changed CAD files, upload them, and attach Baserow file references."""
+    for part in parts:
+        part_number = part["Part Number"]
+        existing = existing_by_number.get(part_number, {})
+
+        drawing_url = drawing_urls.get(part_number, "")
+        existing_pdf = baserow_file_references(existing.get("Drawing PDF"))
+        existing_pdf_key = str(existing.get("Drawing PDF Export Key") or "")
+        if drawing_url:
+            desired_pdf_key = drawing_export_key(drawing_url)
+            if existing_pdf and existing_pdf_key == desired_pdf_key:
+                print(f"Reusing cached drawing PDF for {part_number}")
+                part["Drawing PDF"] = existing_pdf
+                part["Drawing PDF Export Key"] = existing_pdf_key
+            else:
+                try:
+                    print(f"Exporting drawing PDF for {part_number}")
+                    content = export_drawing_pdf(drawing_url)
+                    uploaded = client.upload_file(
+                        f"{safe_export_filename(part_number)}.pdf",
+                        content,
+                        "application/pdf",
+                    )
+                    part["Drawing PDF"] = [{"name": uploaded["name"]}]
+                    part["Drawing PDF Export Key"] = desired_pdf_key
+                except Exception as exc:
+                    warning = f"PDF export failed for {part_number}: {exc}"
+                    warnings.append(warning)
+                    print(f"WARNING: {warning}")
+                    part["Drawing PDF"] = existing_pdf
+                    part["Drawing PDF Export Key"] = existing_pdf_key
+        else:
+            part["Drawing PDF"] = existing_pdf
+            part["Drawing PDF Export Key"] = existing_pdf_key
+
+        references = part_references.get(part_number, [])
+        existing_step = baserow_file_references(existing.get("STEP File"))
+        existing_step_key = str(existing.get("STEP Export Key") or "")
+        if references:
+            desired_step_key = step_export_key(references)
+            if existing_step and existing_step_key == desired_step_key:
+                print(f"Reusing cached STEP file for {part_number}")
+                part["STEP File"] = existing_step
+                part["STEP Export Key"] = existing_step_key
+            else:
+                try:
+                    exported_steps = []
+                    for index, reference in enumerate(references, start=1):
+                        print(
+                            f"Exporting STEP file for {part_number} "
+                            f"({index}/{len(references)})"
+                        )
+                        exported_steps.append(
+                            (
+                                step_filename(
+                                    part_number, reference, len(references)
+                                ),
+                                export_part_step(reference),
+                            )
+                        )
+                    uploaded_steps = []
+                    for filename, content in exported_steps:
+                        uploaded = client.upload_file(
+                            filename,
+                            content,
+                            "application/step",
+                        )
+                        uploaded_steps.append({"name": uploaded["name"]})
+                    part["STEP File"] = uploaded_steps
+                    part["STEP Export Key"] = desired_step_key
+                except Exception as exc:
+                    warning = f"STEP export failed for {part_number}: {exc}"
+                    warnings.append(warning)
+                    print(f"WARNING: {warning}")
+                    part["STEP File"] = existing_step
+                    part["STEP Export Key"] = existing_step_key
+        else:
+            part["STEP File"] = existing_step
+            part["STEP Export Key"] = existing_step_key
+
+
+def sync_to_baserow(
+    parts: list[dict],
+    requirements: list[dict],
+    warnings: list[str],
+    source_rows: int,
+    *,
+    sync_cad_files: bool = False,
+    drawing_urls: dict[str, str] | None = None,
+    part_references: dict[str, list[OnshapePartReference]] | None = None,
+) -> dict:
     client = BaserowClient(require_env("BASEROW_API_URL"), require_env("BASEROW_TOKEN"))
     table_ids = {
         "sync": int(require_env("BASEROW_SYNC_RUNS_TABLE_ID")),
@@ -726,9 +1083,41 @@ def sync_to_baserow(parts: list[dict], requirements: list[dict], warnings: list[
         assembly_rows = client.list_rows(table_ids["assemblies"])
         assembly_ids = {str(r.get("Assembly Number") or ""): r["id"] for r in assembly_rows}
 
+        if sync_cad_files:
+            existing_parts = client.list_rows(table_ids["parts"])
+            prepare_cad_attachments(
+                client,
+                parts,
+                {
+                    str(row.get("Part Number") or ""): row
+                    for row in existing_parts
+                },
+                drawing_urls or {},
+                part_references or {},
+                warnings,
+            )
+
         for part in parts:
             part["Last Synced At"] = now
-        part_fields = ("Name", "Description", "Material", "Manufacturing Method", "Vendor", "Revision", "Onshape State", "Category", "Onshape Drawing", "Active")
+        part_fields = (
+            "Name",
+            "Description",
+            "Material",
+            "Manufacturing Method",
+            "Vendor",
+            "Revision",
+            "OnShape Text",
+            "Category",
+            "Onshape Drawing",
+            "Active",
+        )
+        if sync_cad_files:
+            part_fields += (
+                "Drawing PDF",
+                "STEP File",
+                "Drawing PDF Export Key",
+                "STEP Export Key",
+            )
         upsert_table(client, table_ids["parts"], "Part Number", parts, part_fields)
         part_rows = client.list_rows(table_ids["parts"])
         part_ids = {str(r.get("Part Number") or ""): r["id"] for r in part_rows}
@@ -802,6 +1191,7 @@ def run_sync(
     *,
     dry_run: bool = False,
     output_json: str = "",
+    sync_cad_files: bool = False,
 ) -> dict:
     released = resolve_latest_released_assembly(target)
     released_target = released.bom_target(target.base_url)
@@ -822,7 +1212,13 @@ def run_sync(
     )
     for part in parts:
         part["Onshape Drawing"] = drawing_urls.get(part["Part Number"], "")
-    warnings = sorted(set(warnings + drawing_warnings))
+    part_references: dict[str, list[OnshapePartReference]] = {}
+    step_warnings: list[str] = []
+    if sync_cad_files:
+        part_references, step_warnings = part_export_references(
+            raw_items, prefixes, target.base_url
+        )
+    warnings = sorted(set(warnings + drawing_warnings + step_warnings))
     print(
         "Released assembly "
         f"part={released.part_number or '(none)'} "
@@ -833,7 +1229,8 @@ def run_sync(
     print(
         f"Onshape rows={len(raw_items)} parts={len(parts)} "
         f"production_requirements={len(requirements)} "
-        f"drawings={len(drawing_urls)}"
+        f"drawings={len(drawing_urls)} "
+        f"step_configurations={sum(map(len, part_references.values()))}"
     )
     for warning in warnings:
         print(f"WARNING: {warning}")
@@ -847,6 +1244,10 @@ def run_sync(
             "requirements": requirements,
             "warnings": warnings,
         }
+        if sync_cad_files:
+            result["cad_files"] = planned_cad_files(
+                parts, drawing_urls, part_references
+            )
         print("DRY RUN: no Baserow API calls were made")
         if output_json:
             destination = Path(output_json)
@@ -859,7 +1260,15 @@ def run_sync(
 
     if output_json:
         raise ValueError("--output-json is only available with --dry-run")
-    summary = sync_to_baserow(parts, requirements, warnings, source_rows=len(raw_items))
+    summary = sync_to_baserow(
+        parts,
+        requirements,
+        warnings,
+        source_rows=len(raw_items),
+        sync_cad_files=sync_cad_files,
+        drawing_urls=drawing_urls,
+        part_references=part_references,
+    )
     print(json.dumps(summary, indent=2))
     return summary
 
@@ -891,6 +1300,7 @@ def main(argv: list[str] | None = None) -> int:
         prefixes,
         dry_run=args.dry_run,
         output_json=args.output_json,
+        sync_cad_files=environment_flag("SYNC_CAD_FILES"),
     )
     return 0
 
