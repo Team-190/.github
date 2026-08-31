@@ -28,7 +28,7 @@ ASSEMBLY_NAME_RE = re.compile(r"^A-[A-Za-z0-9-]+$")
 BATCH_SIZE = 100
 ONSHAPE_API_VERSION = "v16"
 ASSEMBLY_ELEMENT_TYPE = 1
-CAD_EXPORT_CACHE_VERSION = "v1"
+CAD_EXPORT_CACHE_VERSION = "v2"
 TRANSLATION_TIMEOUT_SECONDS = 180
 
 
@@ -73,6 +73,12 @@ class OnshapePartReference:
                 self.configuration,
             )
         )
+
+
+@dataclass(frozen=True)
+class CadExport:
+    filename: str
+    content: bytes
 
 
 @dataclass(frozen=True)
@@ -246,7 +252,9 @@ def poll_translation(base_url: str, translation: dict) -> dict:
         delay = min(delay * 2, 8.0)
 
 
-def download_translation(base_url: str, document_id: str, translation: dict) -> bytes:
+def download_translation(
+    base_url: str, document_id: str, translation: dict
+) -> tuple[dict, bytes]:
     completed = poll_translation(base_url, translation)
     external_ids = completed.get("resultExternalDataIds") or []
     if isinstance(external_ids, str):
@@ -262,7 +270,7 @@ def download_translation(base_url: str, document_id: str, translation: dict) -> 
         f"{base_url.rstrip('/')}/api/{ONSHAPE_API_VERSION}/documents/d/"
         f"{document_id}/externaldata/{quote(foreign_id, safe='')}"
     )
-    return onshape_get_bytes(endpoint)
+    return completed, onshape_get_bytes(endpoint)
 
 
 def normalized_configuration(value) -> str:
@@ -600,12 +608,23 @@ def step_export_key(references: list[OnshapePartReference]) -> str:
     return f"{CAD_EXPORT_CACHE_VERSION}|step|{digest}"
 
 
-def safe_export_filename(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-.")
-    return cleaned or "part"
+def export_rule_filename(
+    translation: dict,
+    fallback_stem: str,
+    extensions: tuple[str, ...],
+    default_extension: str,
+) -> str:
+    filename = str(
+        translation.get("exportRuleFileName")
+        or translation.get("name")
+        or fallback_stem
+    ).strip()
+    if filename.casefold().endswith(tuple(value.casefold() for value in extensions)):
+        return filename
+    return filename + default_extension
 
 
-def export_drawing_pdf(drawing_url: str) -> bytes:
+def export_drawing_pdf(drawing_url: str) -> CadExport:
     target = parse_onshape_doc_url(drawing_url)
     if target.wvm_type not in ("w", "v"):
         raise ValueError("Drawing exports require an Onshape workspace or version")
@@ -615,12 +634,26 @@ def export_drawing_pdf(drawing_url: str) -> bytes:
     )
     translation = onshape_post_json(
         endpoint,
-        {"formatName": "PDF", "storeInDocument": False},
+        {
+            "formatName": "PDF",
+            "storeInDocument": False,
+            "evaluateExportRule": True,
+        },
     )
-    return download_translation(target.base_url, target.did, translation)
+    completed, content = download_translation(
+        target.base_url, target.did, translation
+    )
+    filename_metadata = {
+        **translation,
+        **{key: value for key, value in completed.items() if value not in (None, "")},
+    }
+    return CadExport(
+        export_rule_filename(filename_metadata, "drawing", (".pdf",), ".pdf"),
+        content,
+    )
 
 
-def export_part_step(reference: OnshapePartReference) -> bytes:
+def export_part_step(reference: OnshapePartReference) -> CadExport:
     endpoint = (
         f"{reference.base_url.rstrip('/')}/api/{ONSHAPE_API_VERSION}/partstudios/"
         f"d/{reference.did}/{reference.wvm_type}/{reference.wvm_id}/e/"
@@ -631,12 +664,25 @@ def export_part_step(reference: OnshapePartReference) -> bytes:
         {
             "formatName": "STEP",
             "storeInDocument": False,
+            "evaluateExportRule": True,
             "configuration": quote(reference.configuration, safe=""),
             "partIds": reference.part_id,
             "stepVersionString": "AP242",
         },
     )
-    return download_translation(reference.base_url, reference.did, translation)
+    completed, content = download_translation(
+        reference.base_url, reference.did, translation
+    )
+    filename_metadata = {
+        **translation,
+        **{key: value for key, value in completed.items() if value not in (None, "")},
+    }
+    return CadExport(
+        export_rule_filename(
+            filename_metadata, "part", (".step", ".stp"), ".step"
+        ),
+        content,
+    )
 
 
 def fetch_document_elements(reference: OnshapeDocumentReference) -> list[dict]:
@@ -934,16 +980,6 @@ def baserow_file_references(value) -> list[dict[str, str]]:
     ]
 
 
-def step_filename(
-    part_number: str, reference: OnshapePartReference, reference_count: int
-) -> str:
-    stem = safe_export_filename(part_number)
-    if reference_count == 1:
-        return f"{stem}.step"
-    suffix = hashlib.sha256(reference.cache_value().encode()).hexdigest()[:10]
-    return f"{stem}-{suffix}.step"
-
-
 def planned_cad_files(
     parts: list[dict],
     drawing_urls: dict[str, str],
@@ -955,13 +991,12 @@ def planned_cad_files(
         references = part_references.get(part_number, [])
         planned[part_number] = {
             "drawing_pdf": (
-                f"{safe_export_filename(part_number)}.pdf"
+                "determined by Onshape export rule"
                 if drawing_urls.get(part_number)
                 else None
             ),
             "step_files": [
-                step_filename(part_number, reference, len(references))
-                for reference in references
+                "determined by Onshape export rule" for _ in references
             ],
         }
     return planned
@@ -992,10 +1027,10 @@ def prepare_cad_attachments(
             else:
                 try:
                     print(f"Exporting drawing PDF for {part_number}")
-                    content = export_drawing_pdf(drawing_url)
+                    exported = export_drawing_pdf(drawing_url)
                     uploaded = client.upload_file(
-                        f"{safe_export_filename(part_number)}.pdf",
-                        content,
+                        exported.filename,
+                        exported.content,
                         "application/pdf",
                     )
                     part["Drawing PDF"] = [{"name": uploaded["name"]}]
@@ -1021,25 +1056,18 @@ def prepare_cad_attachments(
                 part["STEP Export Key"] = existing_step_key
             else:
                 try:
-                    exported_steps = []
+                    exported_steps: list[CadExport] = []
                     for index, reference in enumerate(references, start=1):
                         print(
                             f"Exporting STEP file for {part_number} "
                             f"({index}/{len(references)})"
                         )
-                        exported_steps.append(
-                            (
-                                step_filename(
-                                    part_number, reference, len(references)
-                                ),
-                                export_part_step(reference),
-                            )
-                        )
+                        exported_steps.append(export_part_step(reference))
                     uploaded_steps = []
-                    for filename, content in exported_steps:
+                    for exported in exported_steps:
                         uploaded = client.upload_file(
-                            filename,
-                            content,
+                            exported.filename,
+                            exported.content,
                             "application/step",
                         )
                         uploaded_steps.append({"name": uploaded["name"]})

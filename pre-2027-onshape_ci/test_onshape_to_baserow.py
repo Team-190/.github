@@ -532,17 +532,20 @@ class CadAttachmentTests(unittest.TestCase):
             "id": "translation-id",
             "requestState": "DONE",
             "resultExternalDataIds": ["foreign-id"],
+            "exportRuleFileName": "190-P-260100 Rev C",
         }
         with patch.object(
             MODULE, "onshape_post_json", return_value=translation
         ) as post_json, patch.object(
             MODULE, "onshape_get_bytes", return_value=b"pdf"
         ) as get_bytes:
-            content = MODULE.export_drawing_pdf(drawing_url)
+            exported = MODULE.export_drawing_pdf(drawing_url)
 
-        self.assertEqual(content, b"pdf")
+        self.assertEqual(exported.content, b"pdf")
+        self.assertEqual(exported.filename, "190-P-260100 Rev C.pdf")
         self.assertIn("/drawings/d/", post_json.call_args.args[0])
         self.assertEqual(post_json.call_args.args[1]["formatName"], "PDF")
+        self.assertTrue(post_json.call_args.args[1]["evaluateExportRule"])
         self.assertIn("/externaldata/foreign-id", get_bytes.call_args.args[0])
 
     def test_step_export_selects_part_configuration_and_ap242(self):
@@ -551,20 +554,23 @@ class CadAttachmentTests(unittest.TestCase):
             "id": "translation-id",
             "requestState": "DONE",
             "resultExternalDataIds": ["foreign-id"],
+            "exportRuleFileName": "Shop Export - Roller Plate.stp",
         }
         with patch.object(
             MODULE, "onshape_post_json", return_value=translation
         ) as post_json, patch.object(
             MODULE, "onshape_get_bytes", return_value=b"step"
         ):
-            content = MODULE.export_part_step(reference)
+            exported = MODULE.export_part_step(reference)
 
-        self.assertEqual(content, b"step")
+        self.assertEqual(exported.content, b"step")
+        self.assertEqual(exported.filename, "Shop Export - Roller Plate.stp")
         endpoint, body = post_json.call_args.args
         self.assertIn("/partstudios/d/", endpoint)
         self.assertEqual(body["partIds"], "JHD")
         self.assertEqual(body["configuration"], "Length%3D2%2Bmeter")
         self.assertEqual(body["stepVersionString"], "AP242")
+        self.assertTrue(body["evaluateExportRule"])
         self.assertFalse(body["storeInDocument"])
 
     def test_matching_export_keys_reuse_existing_files(self):
@@ -664,11 +670,11 @@ class CadAttachmentTests(unittest.TestCase):
 
         self.assertEqual(
             saved["cad_files"]["P-190B-260100"]["drawing_pdf"],
-            "P-190B-260100.pdf",
+            "determined by Onshape export rule",
         )
         self.assertEqual(
             saved["cad_files"]["P-190B-260100"]["step_files"],
-            ["P-190B-260100.step"],
+            ["determined by Onshape export rule"],
         )
 
     def test_multiple_matching_drawings_warn_and_leave_link_blank(self):

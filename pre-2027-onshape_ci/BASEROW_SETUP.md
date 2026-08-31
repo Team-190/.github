@@ -53,6 +53,9 @@ Field names are API contracts and must match the names below exactly.
 - `Active` — boolean
 - `Last Synced At` — date with time
 
+PDF and STEP uploads use the filename produced by the applicable Onshape export
+rule. The sync does not replace that name with the part number.
+
 If `Manufacturing Method` is a single select, create choices for every Onshape
 value before the first sync, including `SELECT VALUE:` during migration.
 
