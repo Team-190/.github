@@ -439,7 +439,7 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(saved["requirements"][0]["BOM Positions"], "1.2")
         self.assertEqual(len(saved["operations"]), 1)
         self.assertEqual(saved["operations"][0]["Operation Number"], "OP1")
-        self.assertEqual(saved["operations"][0]["Machine"], "Haas")
+        self.assertEqual(saved["operations"][0]["Machine"], "Haas CNC")
         self.assertEqual(
             {export["field"] for export in saved["file_exports"]["P-190B-260100"]},
             {MODULE.DRAWING_PDF_FIELD, MODULE.STEP_FILE_FIELD},
@@ -1021,7 +1021,7 @@ class RecordBuildingTests(unittest.TestCase):
         self.assertEqual(fetch_metadata.call_count, 1)
         self.assertEqual(
             MODULE.operation_machines_from_row(hydrated[0]),
-            (("OP1", "Haas"), ("OP2", "Shop Sabre CNC")),
+            (("OP1", "Haas CNC"), ("OP2", "Shop Sabre CNC")),
         )
 
     def test_part_metadata_request_includes_configuration(self):
@@ -1073,7 +1073,7 @@ class RecordBuildingTests(unittest.TestCase):
                 for operation in operations
             ],
             [
-                ("OP1", "Haas"),
+                ("OP1", "Haas CNC"),
                 ("OP2", "Bambu 3D Printer"),
                 ("OP3", "Shop Sabre CNC"),
             ],
@@ -1406,7 +1406,7 @@ class MultiRootSyncTests(unittest.TestCase):
                             "Operation": "stale-current-root",
                             "Production Requirement": [{"id": 30}],
                             "Operation Number": "OP4",
-                            "Machine": "Haas",
+                            "Machine": "Haas CNC",
                             "Operation Status": "In Progress",
                             "Active in Routing": True,
                         },
@@ -1415,7 +1415,7 @@ class MultiRootSyncTests(unittest.TestCase):
                             "Operation": "stale-other-root",
                             "Production Requirement": [{"id": 31}],
                             "Operation Number": "OP4",
-                            "Machine": "Haas",
+                            "Machine": "Haas CNC",
                             "Operation Status": "In Progress",
                             "Active in Routing": True,
                         },
@@ -1488,7 +1488,7 @@ class MultiRootSyncTests(unittest.TestCase):
                         "Operation": operation_key,
                         "production_key": requirement["Production Key"],
                         "Operation Number": "OP1",
-                        "Machine": "Haas",
+                        "Machine": "Haas CNC",
                         "Active in Routing": True,
                     }
                 ],
@@ -1522,7 +1522,7 @@ class MultiRootSyncTests(unittest.TestCase):
             if row["Operation"] == operation_key
         )
         self.assertEqual(created_operation["Operation Number"], "OP1")
-        self.assertEqual(created_operation["Machine"], "Haas")
+        self.assertEqual(created_operation["Machine"], "Haas CNC")
         self.assertNotIn("Operation Status", created_operation)
         assembly_updates = [
             row

@@ -162,7 +162,7 @@ so the custom properties do not need to be visible columns in the assembly BOM.
 Property names and values are matched case-insensitively. `None` creates no
 operation. Machine names are copied from Onshape except for these aliases:
 
-- `Haas CNC` or `Haas` becomes `Haas`
+- `Haas CNC` or `Haas` becomes `Haas CNC`
 - `ShopSabre`, `Shop Sabre`, or `Shop Sabre CNC` becomes `Shop Sabre CNC`
 
 The sync creates and updates `Operation`, `Production Requirement`, `Operation
