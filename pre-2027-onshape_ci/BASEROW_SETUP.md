@@ -32,7 +32,7 @@ The Delta workflow is configured for these Baserow tables:
 | Sync Runs | 1119639 |
 | Parts | 1119641 |
 | Production Requirements | 1119642 |
-| Operations | repository variable `BASEROW_OPERATIONS_TABLE_ID` |
+| Operations | 1169282 |
 | Storage Locations | 1119643 |
 | Assemblies | 1119645 |
 
@@ -196,11 +196,6 @@ Baserow before attaching them to Parts rows.
 For Baserow Cloud, no `BASEROW_API_URL` repository variable is necessary. For
 self-hosting, add a repository Actions variable named `BASEROW_API_URL`, for example
 `https://baserow.example.org/api`.
-
-Add a repository Actions variable named `BASEROW_OPERATIONS_TABLE_ID` containing
-the numeric Operations table ID from its Baserow URL. Both production workflows
-require this variable; dry runs do not call Baserow and therefore do not require
-it.
 
 Create `ONSHAPE_DOC_URL_DELTA` and `ONSHAPE_DOC_URL_EPSILON` repository Actions
 secrets containing the applicable master assembly Main-workspace URLs. No
