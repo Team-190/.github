@@ -9,7 +9,7 @@ on:
         default: false
         type: boolean
       onshape_doc_url:
-        description: Optional assembly URL override for manual runs
+        description: Optional manufacturing-root assembly URL for manual runs
         required: false
         type: string
   repository_dispatch:
@@ -47,16 +47,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r pre-2027-onshape_ci/requirements.txt
 
-      - name: Run sync unit tests
+      - name: Test Onshape to Baserow sync
         run: python -m unittest pre-2027-onshape_ci/test_onshape_to_baserow.py
 
       - name: Sync BOM to Baserow
         env:
           ONSHAPE_ACCESS_KEY: ${{ secrets.ONSHAPE_ACCESS_KEY }}
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
-          ONSHAPE_DOC_URL: >-
+          ONSHAPE_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_EPSILON }}
+          ONSHAPE_MASTER_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_EPSILON }}
+          ONSHAPE_MANUFACTURING_ROOT_URLS: >-
             ${{ github.event_name == 'workflow_dispatch' &&
-                inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_EPSILON }}
+                inputs.onshape_doc_url || secrets.ONSHAPE_MANUFACTURING_ROOT_URLS_EPSILON }}
           PARTNUMBER_PREFIXES: "P-190B-26"
           SYNC_CAD_FILES: "true"
 
@@ -67,13 +69,14 @@ jobs:
           BASEROW_REQUIREMENTS_TABLE_ID: "1119642"
           BASEROW_STORAGE_LOCATIONS_TABLE_ID: "1119643"
           BASEROW_ASSEMBLIES_TABLE_ID: "1119645"
+          ONSHAPE_EXPORT_TIMEOUT_SECONDS: "600"
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python pre-2027-onshape_ci/OnshapeToBaserow.py
 
   dry-run:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -91,14 +94,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r pre-2027-onshape_ci/requirements.txt
 
-      - name: Run sync unit tests
+      - name: Test Onshape to Baserow sync
         run: python -m unittest pre-2027-onshape_ci/test_onshape_to_baserow.py
 
       - name: Resolve released BOM without Baserow
         env:
           ONSHAPE_ACCESS_KEY: ${{ secrets.ONSHAPE_ACCESS_KEY }}
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
-          ONSHAPE_DOC_URL: ${{ inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_EPSILON }}
+          ONSHAPE_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_EPSILON }}
+          ONSHAPE_MASTER_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_EPSILON }}
+          ONSHAPE_MANUFACTURING_ROOT_URLS: >-
+            ${{ inputs.onshape_doc_url || secrets.ONSHAPE_MANUFACTURING_ROOT_URLS_EPSILON }}
           PARTNUMBER_PREFIXES: "P-190B-26"
           SYNC_CAD_FILES: "true"
         run: >-

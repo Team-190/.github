@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -107,7 +108,7 @@ def v16_bom_response():
                     revision="C",
                     state="RELEASED",
                     material={"displayName": "Aluminum - 6061"},
-                    manufacturingmethod="MILL",
+                    manufacturingmethod="Haas CNC",
                     vendor="FRC 190",
                     category="Fabricated",
                 ),
@@ -224,6 +225,21 @@ class ReleaseResolutionTests(unittest.TestCase):
 
         self.assertEqual(get_json.call_count, 1)
 
+    def test_manufacturing_root_urls_accept_json_and_newlines(self):
+        first = f"https://cad.onshape.com/documents/{DID}/w/{WID}/e/{EID}"
+        second = (
+            f"https://cad.onshape.com/documents/{RELEASE_DID}/w/{WID}/e/"
+            f"{RELEASE_EID}"
+        )
+        self.assertEqual(
+            MODULE.configured_onshape_urls(json.dumps([first, second, first])),
+            [first, second],
+        )
+        self.assertEqual(
+            MODULE.configured_onshape_urls(f"{first}\n{second}"),
+            [first, second],
+        )
+
     def test_bom_is_fetched_from_immutable_released_version(self):
         released = MODULE.released_assembly_from_revision(
             revision(
@@ -281,7 +297,8 @@ class ReleaseResolutionTests(unittest.TestCase):
                 return_value=(
                     {
                         "P-190B-260100": (
-                            "https://cad.onshape.com/documents/drawing/v/version/e/element"
+                            f"https://cad.onshape.com/documents/{'4' * 24}/v/"
+                            f"{'5' * 24}/e/{'6' * 24}"
                         )
                     },
                     [],
@@ -290,7 +307,11 @@ class ReleaseResolutionTests(unittest.TestCase):
                 MODULE, "sync_to_baserow", side_effect=AssertionError("Baserow called")
             ):
                 MODULE.run_sync(
-                    target(), ["P-190B-26"], dry_run=True, output_json=str(output)
+                    target(),
+                    ["P-190B-26"],
+                    dry_run=True,
+                    output_json=str(output),
+                    sync_cad_files=True,
                 )
             saved = json.loads(output.read_text(encoding="utf-8"))
 
@@ -304,13 +325,18 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(saved["parts"][0]["Material"], "Aluminum - 6061")
         self.assertEqual(
             saved["parts"][0]["Onshape Drawing"],
-            "https://cad.onshape.com/documents/drawing/v/version/e/element",
+            f"https://cad.onshape.com/documents/{'4' * 24}/v/"
+            f"{'5' * 24}/e/{'6' * 24}",
         )
         self.assertEqual(len(saved["requirements"]), 1)
         self.assertEqual(saved["requirements"][0]["assembly_number"], "A-190B-260001")
         self.assertEqual(saved["requirements"][0]["Configuration"], "width=0.5+meter")
         self.assertEqual(saved["requirements"][0]["Required Quantity"], 2)
         self.assertEqual(saved["requirements"][0]["BOM Positions"], "1.2")
+        self.assertEqual(
+            {export["field"] for export in saved["file_exports"]["P-190B-260100"]},
+            {MODULE.DRAWING_PDF_FIELD, MODULE.STEP_FILE_FIELD},
+        )
 
     def test_dry_run_writes_records_without_baserow(self):
         released = MODULE.released_assembly_from_revision(revision("B", VID_B))
@@ -483,200 +509,6 @@ class DrawingLinkTests(unittest.TestCase):
             f"v/{released_reference.wvm_id}/e/{drawing_eid}",
         )
 
-
-class CadAttachmentTests(unittest.TestCase):
-    def part_reference(self, configuration="default"):
-        return MODULE.OnshapePartReference(
-            "https://cad.onshape.com",
-            "1" * 24,
-            "v",
-            "2" * 24,
-            "3" * 24,
-            "JHD",
-            configuration,
-        )
-
-    def test_part_export_references_keep_each_configuration(self):
-        rows = []
-        for configuration in ("Length=1+meter", "Length=2+meter"):
-            rows.append(
-                {
-                    "partNumber": "P-190B-260100",
-                    "itemSource": {
-                        "documentId": "1" * 24,
-                        "wvmType": "v",
-                        "wvmId": "2" * 24,
-                        "elementId": "3" * 24,
-                        "partId": "JHD",
-                        "configuration": configuration,
-                    },
-                }
-            )
-
-        references, warnings = MODULE.part_export_references(
-            rows, ["P-190B-26"], "https://cad.onshape.com"
-        )
-
-        self.assertEqual(warnings, [])
-        self.assertEqual(
-            {reference.configuration for reference in references["P-190B-260100"]},
-            {"Length=1+meter", "Length=2+meter"},
-        )
-
-    def test_drawing_pdf_export_downloads_external_data(self):
-        drawing_url = (
-            f"https://cad.onshape.com/documents/{'1' * 24}/v/{'2' * 24}/e/"
-            f"{'3' * 24}"
-        )
-        translation = {
-            "id": "translation-id",
-            "requestState": "DONE",
-            "resultExternalDataIds": ["foreign-id"],
-            "exportRuleFileName": "190-P-260100 Rev C",
-        }
-        with patch.object(
-            MODULE, "onshape_post_json", return_value=translation
-        ) as post_json, patch.object(
-            MODULE, "onshape_get_bytes", return_value=b"pdf"
-        ) as get_bytes:
-            exported = MODULE.export_drawing_pdf(drawing_url)
-
-        self.assertEqual(exported.content, b"pdf")
-        self.assertEqual(exported.filename, "190-P-260100 Rev C.pdf")
-        self.assertIn("/drawings/d/", post_json.call_args.args[0])
-        self.assertEqual(post_json.call_args.args[1]["formatName"], "PDF")
-        self.assertTrue(post_json.call_args.args[1]["evaluateExportRule"])
-        self.assertIn("/externaldata/foreign-id", get_bytes.call_args.args[0])
-
-    def test_step_export_selects_part_configuration_and_ap242(self):
-        reference = self.part_reference("Length=2+meter")
-        translation = {
-            "id": "translation-id",
-            "requestState": "DONE",
-            "resultExternalDataIds": ["foreign-id"],
-            "exportRuleFileName": "Shop Export - Roller Plate.stp",
-        }
-        with patch.object(
-            MODULE, "onshape_post_json", return_value=translation
-        ) as post_json, patch.object(
-            MODULE, "onshape_get_bytes", return_value=b"step"
-        ):
-            exported = MODULE.export_part_step(reference)
-
-        self.assertEqual(exported.content, b"step")
-        self.assertEqual(exported.filename, "Shop Export - Roller Plate.stp")
-        endpoint, body = post_json.call_args.args
-        self.assertIn("/partstudios/d/", endpoint)
-        self.assertEqual(body["partIds"], "JHD")
-        self.assertEqual(body["configuration"], "Length%3D2%2Bmeter")
-        self.assertEqual(body["stepVersionString"], "AP242")
-        self.assertTrue(body["evaluateExportRule"])
-        self.assertFalse(body["storeInDocument"])
-
-    def test_matching_export_keys_reuse_existing_files(self):
-        reference = self.part_reference()
-        drawing_url = (
-            f"https://cad.onshape.com/documents/{'4' * 24}/v/{'5' * 24}/e/"
-            f"{'6' * 24}"
-        )
-        existing = {
-            "Part Number": "P-190B-260100",
-            "Drawing PDF": [{"name": "existing.pdf", "size": 12}],
-            "Drawing PDF Export Key": MODULE.drawing_export_key(drawing_url),
-            "STEP File": [{"name": "existing.step", "size": 34}],
-            "STEP Export Key": MODULE.step_export_key([reference]),
-        }
-        client = types.SimpleNamespace(
-            upload_file=lambda *args: self.fail("cached file was uploaded again")
-        )
-        parts = [{"Part Number": "P-190B-260100"}]
-        with patch.object(
-            MODULE, "export_drawing_pdf", side_effect=AssertionError("PDF exported")
-        ), patch.object(
-            MODULE, "export_part_step", side_effect=AssertionError("STEP exported")
-        ):
-            MODULE.prepare_cad_attachments(
-                client,
-                parts,
-                {"P-190B-260100": existing},
-                {"P-190B-260100": drawing_url},
-                {"P-190B-260100": [reference]},
-                [],
-            )
-
-        self.assertEqual(parts[0]["Drawing PDF"], [{"name": "existing.pdf"}])
-        self.assertEqual(parts[0]["STEP File"], [{"name": "existing.step"}])
-
-    def test_failed_export_preserves_existing_attachment(self):
-        reference = self.part_reference("Length=changed")
-        existing = {
-            "Part Number": "P-190B-260100",
-            "STEP File": [{"name": "last-good.step"}],
-            "STEP Export Key": "old-key",
-        }
-        parts = [{"Part Number": "P-190B-260100"}]
-        warnings = []
-        with patch.object(
-            MODULE, "export_part_step", side_effect=RuntimeError("translation failed")
-        ):
-            MODULE.prepare_cad_attachments(
-                types.SimpleNamespace(upload_file=lambda *args: {}),
-                parts,
-                {"P-190B-260100": existing},
-                {},
-                {"P-190B-260100": [reference]},
-                warnings,
-            )
-
-        self.assertEqual(parts[0]["STEP File"], [{"name": "last-good.step"}])
-        self.assertEqual(parts[0]["STEP Export Key"], "old-key")
-        self.assertIn("translation failed", warnings[0])
-
-    def test_cad_dry_run_only_reports_planned_files(self):
-        released = MODULE.released_assembly_from_revision(revision("B", VID_B))
-        reference = self.part_reference("Length=2+meter")
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output = Path(temp_dir) / "dry-run.json"
-            with patch.object(
-                MODULE, "resolve_latest_released_assembly", return_value=released
-            ), patch.object(
-                MODULE, "fetch_bom", return_value=MODULE.normalize_bom_rows(
-                    v16_bom_response()["headers"], v16_bom_response()["rows"]
-                )
-            ), patch.object(
-                MODULE,
-                "drawing_urls_for_parts",
-                return_value=(
-                    {"P-190B-260100": "https://cad.onshape.com/documents/d/v/v/e/e"},
-                    [],
-                ),
-            ), patch.object(
-                MODULE,
-                "part_export_references",
-                return_value=({"P-190B-260100": [reference]}, []),
-            ), patch.object(
-                MODULE, "export_part_step", side_effect=AssertionError("STEP exported")
-            ), patch.object(
-                MODULE, "export_drawing_pdf", side_effect=AssertionError("PDF exported")
-            ):
-                MODULE.run_sync(
-                    target(),
-                    ["P-190B-26"],
-                    dry_run=True,
-                    output_json=str(output),
-                    sync_cad_files=True,
-                )
-            saved = json.loads(output.read_text(encoding="utf-8"))
-
-        self.assertEqual(
-            saved["cad_files"]["P-190B-260100"]["drawing_pdf"],
-            "determined by Onshape export rule",
-        )
-        self.assertEqual(
-            saved["cad_files"]["P-190B-260100"]["step_files"],
-            ["determined by Onshape export rule"],
-        )
-
     def test_multiple_matching_drawings_warn_and_leave_link_blank(self):
         part_did = "1" * 24
         part_vid = "2" * 24
@@ -756,7 +588,231 @@ class CadAttachmentTests(unittest.TestCase):
         )
 
 
+class FileExportTests(unittest.TestCase):
+    def sample_export(self, field=MODULE.STEP_FILE_FIELD):
+        return MODULE.FileExport(
+            part_number="P-190B-260100",
+            field_name=field,
+            key_field_name=(
+                MODULE.STEP_KEY_FIELD
+                if field == MODULE.STEP_FILE_FIELD
+                else MODULE.DRAWING_PDF_KEY_FIELD
+            ),
+            source_key="source-key",
+            filename="P-190B-260100_rev-C.step",
+            content_type="application/step",
+            endpoint=(
+                f"https://cad.onshape.com/api/v16/partstudios/d/{DID}/v/"
+                f"{VID_B}/e/{EID}/translations"
+            ),
+            request_body={"formatName": "STEP"},
+            source_document_id=DID,
+        )
+
+    def test_build_file_exports_targets_one_part_and_its_configuration(self):
+        rows = v16_bom_response()["rows"]
+        normalized = MODULE.normalize_bom_rows(
+            v16_bom_response()["headers"], rows
+        )
+        parts, _, _ = MODULE.build_records(normalized, ["P-190B-26"])
+        drawing_url = (
+            f"https://cad.onshape.com/documents/{'4' * 24}/v/"
+            f"{'5' * 24}/e/{'6' * 24}"
+        )
+
+        exports, warnings = MODULE.build_file_exports(
+            parts,
+            normalized,
+            {"P-190B-260100": drawing_url},
+            ["P-190B-26"],
+            "https://cad.onshape.com",
+        )
+
+        self.assertEqual(warnings, [])
+        by_field = {export.field_name: export for export in exports["P-190B-260100"]}
+        step = by_field[MODULE.STEP_FILE_FIELD]
+        self.assertIn("/partstudios/d/", step.endpoint)
+        self.assertEqual(step.request_body["partIds"], "JHD")
+        self.assertEqual(step.request_body["configuration"], "width=0.5+meter")
+        self.assertFalse(step.request_body["storeInDocument"])
+        self.assertTrue(step.request_body["evaluateExportRule"])
+        pdf = by_field[MODULE.DRAWING_PDF_FIELD]
+        self.assertIn("/drawings/d/", pdf.endpoint)
+        self.assertEqual(pdf.request_body["formatName"], "PDF")
+        self.assertTrue(pdf.request_body["evaluateExportRule"])
+
+    def test_step_exports_are_limited_to_configured_manufacturing_methods(self):
+        allowed = (
+            "Haas CNC",
+            "Shop Sabre CNC",
+            "Bambu 3D Printer",
+            "Markforged 3D Printer",
+            "FormLabs SLA",
+            "FormLabs SLS",
+        )
+        for method in allowed:
+            with self.subTest(method=method):
+                self.assertTrue(
+                    MODULE.step_export_enabled({"Manufacturing Method": method})
+                )
+        for method in ("Lathe", "Bandsaw", "COTS", "", None):
+            with self.subTest(method=method):
+                self.assertFalse(
+                    MODULE.step_export_enabled({"Manufacturing Method": method})
+                )
+
+    def test_unlisted_method_does_not_plan_or_warn_about_step_export(self):
+        normalized = MODULE.normalize_bom_rows(
+            v16_bom_response()["headers"], v16_bom_response()["rows"]
+        )
+        parts, _, _ = MODULE.build_records(normalized, ["P-190B-26"])
+        parts[0]["Manufacturing Method"] = "Lathe"
+
+        exports, warnings = MODULE.build_file_exports(
+            parts,
+            normalized,
+            {},
+            ["P-190B-26"],
+            "https://cad.onshape.com",
+        )
+
+        self.assertEqual(exports, {})
+        self.assertEqual(warnings, [])
+
+    def test_current_file_and_export_key_skip_translation(self):
+        export = self.sample_export()
+        expected_key = MODULE.aggregate_export_key([export])
+        parts = [{"Part Number": export.part_number}]
+        existing = [
+            {
+                "Part Number": export.part_number,
+                MODULE.STEP_FILE_FIELD: [{"name": "stored-step"}],
+                MODULE.STEP_KEY_FIELD: expected_key,
+            }
+        ]
+
+        with patch.object(
+            MODULE,
+            "start_file_translation",
+            side_effect=AssertionError("translation started"),
+        ):
+            uploaded, cached = MODULE.attach_exported_files(
+                object(), parts, existing, {export.part_number: [export]}, []
+            )
+
+        self.assertEqual((uploaded, cached), (0, 1))
+        self.assertEqual(parts[0][MODULE.STEP_FILE_FIELD], [{"name": "stored-step"}])
+
+    def test_changed_export_is_downloaded_and_uploaded(self):
+        export = self.sample_export()
+        parts = [{"Part Number": export.part_number}]
+        warnings = []
+
+        class Client:
+            def upload_file(self, filename, content, content_type):
+                self.upload = (filename, content, content_type)
+                return {"name": "baserow-file-name"}
+
+        client = Client()
+        with patch.object(
+            MODULE, "start_file_translation", return_value={"id": "translation"}
+        ), patch.object(
+            MODULE,
+            "wait_for_translation",
+            return_value={
+                "resultExternalDataIds": ["external"],
+                "exportRuleFileName": "Configured Shop Export",
+            },
+        ), patch.object(MODULE, "download_translation", return_value=b"STEP"):
+            uploaded, cached = MODULE.attach_exported_files(
+                client, parts, [], {export.part_number: [export]}, warnings
+            )
+
+        self.assertEqual((uploaded, cached), (1, 0))
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            parts[0][MODULE.STEP_FILE_FIELD], [{"name": "baserow-file-name"}]
+        )
+        self.assertEqual(
+            parts[0][MODULE.STEP_KEY_FIELD], MODULE.aggregate_export_key([export])
+        )
+        self.assertEqual(client.upload[0], "Configured Shop Export.step")
+        self.assertEqual(client.upload[1], b"STEP")
+
+    def test_failed_refresh_does_not_clear_the_previous_attachment(self):
+        export = self.sample_export()
+        parts = [{"Part Number": export.part_number}]
+        existing = [
+            {
+                "Part Number": export.part_number,
+                MODULE.STEP_FILE_FIELD: [{"name": "previous"}],
+                MODULE.STEP_KEY_FIELD: "old-key",
+            }
+        ]
+        warnings = []
+
+        with patch.object(
+            MODULE, "start_file_translation", side_effect=RuntimeError("denied")
+        ):
+            uploaded, cached = MODULE.attach_exported_files(
+                object(), parts, existing, {export.part_number: [export]}, warnings
+            )
+
+        self.assertEqual((uploaded, cached), (0, 0))
+        self.assertEqual(parts[0][MODULE.STEP_FILE_FIELD], [{"name": "previous"}])
+        self.assertEqual(parts[0][MODULE.STEP_KEY_FIELD], "old-key")
+        self.assertIn("Could not start STEP File export", warnings[0])
+
+    def test_multiple_file_values_can_be_compared(self):
+        existing = {
+            MODULE.STEP_FILE_FIELD: [
+                {"name": "second", "url": "https://files/second"},
+                {"name": "first", "url": "https://files/first"},
+            ]
+        }
+        desired = {
+            MODULE.STEP_FILE_FIELD: [
+                {"name": "first"},
+                {"name": "second"},
+            ]
+        }
+
+        self.assertFalse(
+            MODULE.changed(
+                existing, desired, (MODULE.STEP_FILE_FIELD,)
+            )
+        )
+
+
 class RecordBuildingTests(unittest.TestCase):
+    def test_direct_parts_are_assigned_to_released_manufacturing_root(self):
+        rows = [
+            {
+                "item": "1",
+                "quantity": "2",
+                "partNumber": "P-190B-260100",
+                "name": "ROOT PLATE",
+                "revision": "C",
+                "itemSource": source("https://example/direct", 0),
+            }
+        ]
+        _, requirements, _ = MODULE.build_records(
+            rows,
+            ["P-190B-26"],
+            source_root="A-190B-260001",
+            source_revision="B",
+        )
+
+        requirement = requirements[0]
+        self.assertEqual(requirement["assembly_number"], "A-190B-260001")
+        self.assertEqual(requirement["Source Root"], "A-190B-260001")
+        self.assertEqual(requirement["Source Assembly Revision"], "B")
+        self.assertEqual(requirement["Required Part Revision"], "C")
+        self.assertEqual(
+            requirement["Production Key"],
+            "A-190B-260001|B|A-190B-260001|P-190B-260100|default",
+        )
+
     def test_repeated_default_configuration_is_aggregated(self):
         rows = [
             {"name": "A-190B-260003", "partNumber": "", "itemSource": source("", 0)},
@@ -790,6 +846,245 @@ class RecordBuildingTests(unittest.TestCase):
         ]
         _, requirements, _ = MODULE.build_records(rows, ["P-190B-26"])
         self.assertEqual(requirements[0]["BOM Positions"], "1.10")
+
+
+class MultiRootSyncTests(unittest.TestCase):
+    def test_independent_roots_use_master_only_for_revision_comparison(self):
+        root_one_target = target()
+        root_two_target = MODULE.OnshapeTarget(
+            "https://cad.onshape.com", "1" * 24, "w", "2" * 24, "3" * 24
+        )
+        master_target = MODULE.OnshapeTarget(
+            "https://cad.onshape.com", "4" * 24, "w", "5" * 24, "6" * 24
+        )
+        root_one = MODULE.released_assembly_from_revision(
+            revision("B", VID_B, partNumber="A-ROOT-ONE")
+        )
+        root_two = MODULE.released_assembly_from_revision(
+            revision(
+                "D",
+                "7" * 24,
+                documentId="1" * 24,
+                elementId="3" * 24,
+                partNumber="A-ROOT-TWO",
+            )
+        )
+        master = MODULE.released_assembly_from_revision(
+            revision(
+                "A",
+                "8" * 24,
+                documentId="4" * 24,
+                elementId="6" * 24,
+                partNumber="A-MASTER",
+            )
+        )
+        root_one_rows = [
+            {
+                "item": "1",
+                "quantity": 1,
+                "partNumber": "P-190B-260101",
+                "name": "ONE",
+                "revision": "C",
+                "itemSource": source("https://example/one", 0),
+            }
+        ]
+        root_two_rows = [
+            {
+                "item": "1",
+                "quantity": 1,
+                "partNumber": "P-190B-260102",
+                "name": "TWO",
+                "revision": "E",
+                "itemSource": source("https://example/two", 0),
+            }
+        ]
+        master_rows = [
+            {
+                "name": "A-ROOT-ONE",
+                "partNumber": "N/A",
+                "revision": "A",
+                "itemSource": source("", 0),
+            },
+            {
+                "name": "A-ROOT-TWO",
+                "partNumber": "N/A",
+                "revision": "D",
+                "itemSource": source("", 0),
+            },
+        ]
+
+        with patch.object(
+            MODULE,
+            "resolve_latest_released_assembly",
+            side_effect=[root_one, root_two, master],
+        ), patch.object(
+            MODULE,
+            "fetch_bom",
+            side_effect=[root_one_rows, root_two_rows, master_rows],
+        ), patch.object(
+            MODULE, "drawing_urls_for_parts", return_value=({}, [])
+        ):
+            result = MODULE.run_sync(
+                [root_one_target, root_two_target],
+                ["P-190B-26"],
+                dry_run=True,
+                master_target=master_target,
+            )
+
+        self.assertEqual(len(result["source_revisions"]), 2)
+        self.assertEqual(len(result["requirements"]), 2)
+        self.assertNotIn("P-190B", json.dumps(result["master_baseline_assemblies"]))
+        assemblies = {
+            row["Assembly Number"]: row for row in result["assemblies"]
+        }
+        self.assertEqual(
+            assemblies["A-ROOT-ONE"]["Integration Status"],
+            "Newer Revision Available",
+        )
+        self.assertEqual(
+            assemblies["A-ROOT-TWO"]["Integration Status"],
+            "Current in Master",
+        )
+
+    def test_deactivation_is_limited_to_the_current_source_root(self):
+        table_ids = {"sync": 1, "parts": 2, "requirements": 3, "assemblies": 4}
+        desired_part = {
+            "Part Number": "P-190B-260101",
+            "Name": "ONE",
+            "Description": "",
+            "Material": "",
+            "Manufacturing Method": "",
+            "Vendor": "",
+            "Revision": "C",
+            "OnShape Text": "RELEASED",
+            "Category": "",
+            "Onshape Drawing": "",
+            "Active": True,
+        }
+
+        class Client:
+            def __init__(self):
+                self.rows = {
+                    table_ids["assemblies"]: [
+                        {"id": 11, "Assembly Number": "A-ROOT-TWO", "Active": True},
+                    ],
+                    table_ids["parts"]: [{"id": 20, **desired_part}],
+                    table_ids["requirements"]: [
+                        {
+                            "id": 30,
+                            "Production Key": "old-one",
+                            "Source Root": "A-ROOT-ONE",
+                            "Assembly": [{"id": 10, "value": "A-ROOT-ONE"}],
+                            "Active in BOM": True,
+                        },
+                        {
+                            "id": 31,
+                            "Production Key": "other-root",
+                            "Source Root": "A-ROOT-TWO",
+                            "Assembly": [{"id": 11, "value": "A-ROOT-TWO"}],
+                            "Active in BOM": True,
+                        },
+                        {
+                            "id": 32,
+                            "Production Key": "legacy-current-root",
+                            "Assembly": [{"id": 10, "value": "A-ROOT-ONE"}],
+                            "Active in BOM": True,
+                        },
+                        {
+                            "id": 33,
+                            "Production Key": "legacy-other-root",
+                            "Assembly": [{"id": 11, "value": "A-ROOT-TWO"}],
+                            "Active in BOM": True,
+                        },
+                    ],
+                }
+                self.updates = []
+                self.next_id = 100
+
+            def create_one(self, table_id, fields):
+                return {"id": 1, **fields}
+
+            def update_one(self, table_id, row_id, fields):
+                return {"id": row_id, **fields}
+
+            def list_rows(self, table_id):
+                return list(self.rows[table_id])
+
+            def batch_create(self, table_id, rows):
+                created = []
+                for row in rows:
+                    self.next_id += 1
+                    item = {"id": self.next_id, **row}
+                    self.rows[table_id].append(item)
+                    created.append(item)
+                return created
+
+            def batch_update(self, table_id, rows):
+                self.updates.append((table_id, list(rows)))
+                return rows
+
+        client = Client()
+        requirement = {
+            "Production Key": (
+                "A-ROOT-ONE|B|A-ROOT-ONE|P-190B-260101|default"
+            ),
+            "part_number": "P-190B-260101",
+            "assembly_number": "A-ROOT-ONE",
+            "Source Root": "A-ROOT-ONE",
+            "Source Assembly Revision": "B",
+            "Required Part Revision": "C",
+            "Configuration": "default",
+            "Required Quantity": 1,
+            "BOM Positions": "1",
+            "Onshape Source": "https://example/one",
+            "Active in BOM": True,
+        }
+        env = {
+            "BASEROW_API_URL": "https://api.baserow.test/api",
+            "BASEROW_TOKEN": "test",
+            "BASEROW_SYNC_RUNS_TABLE_ID": "1",
+            "BASEROW_PARTS_TABLE_ID": "2",
+            "BASEROW_REQUIREMENTS_TABLE_ID": "3",
+            "BASEROW_ASSEMBLIES_TABLE_ID": "4",
+        }
+
+        with patch.dict(os.environ, env), patch.object(
+            MODULE, "BaserowClient", return_value=client
+        ):
+            MODULE.sync_to_baserow(
+                [desired_part],
+                [requirement],
+                [],
+                source_rows=1,
+                exports_by_part={},
+                sync_cad_files=False,
+                synced_roots={"A-ROOT-ONE"},
+            )
+
+        requirement_updates = [
+            row
+            for table_id, rows in client.updates
+            if table_id == table_ids["requirements"]
+            for row in rows
+        ]
+        deactivated_ids = {
+            row["id"]
+            for row in requirement_updates
+            if row.get("Active in BOM") is False
+        }
+        self.assertEqual(deactivated_ids, {30, 32})
+        root_row = next(
+            row
+            for row in client.rows[table_ids["assemblies"]]
+            if row["Assembly Number"] == "A-ROOT-ONE"
+        )
+        created_requirement = next(
+            row
+            for row in client.rows[table_ids["requirements"]]
+            if row["Production Key"] == requirement["Production Key"]
+        )
+        self.assertTrue(root_row["Active"])
+        self.assertEqual(created_requirement["Assembly"], [root_row["id"]])
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ on:
         default: false
         type: boolean
       onshape_doc_url:
-        description: Optional assembly URL override for manual runs
+        description: Optional manufacturing-root assembly URL for manual runs
         required: false
         type: string
   repository_dispatch:
@@ -51,9 +51,11 @@ jobs:
         env:
           ONSHAPE_ACCESS_KEY: ${{ secrets.ONSHAPE_ACCESS_KEY }}
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
-          ONSHAPE_DOC_URL: >-
+          ONSHAPE_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_DELTA }}
+          ONSHAPE_MASTER_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_DELTA }}
+          ONSHAPE_MANUFACTURING_ROOT_URLS: >-
             ${{ github.event_name == 'workflow_dispatch' &&
-                inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_DELTA }}
+                inputs.onshape_doc_url || secrets.ONSHAPE_MANUFACTURING_ROOT_URLS_DELTA }}
           PARTNUMBER_PREFIXES: "P-190B-26"
 
           BASEROW_API_URL: ${{ vars.BASEROW_API_URL || 'https://api.baserow.io/api' }}
@@ -91,7 +93,10 @@ jobs:
         env:
           ONSHAPE_ACCESS_KEY: ${{ secrets.ONSHAPE_ACCESS_KEY }}
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
-          ONSHAPE_DOC_URL: ${{ inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_DELTA }}
+          ONSHAPE_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_DELTA }}
+          ONSHAPE_MASTER_DOC_URL: ${{ secrets.ONSHAPE_DOC_URL_DELTA }}
+          ONSHAPE_MANUFACTURING_ROOT_URLS: >-
+            ${{ inputs.onshape_doc_url || secrets.ONSHAPE_MANUFACTURING_ROOT_URLS_DELTA }}
           PARTNUMBER_PREFIXES: "P-190B-26"
         run: >-
           python pre-2027-onshape_ci/OnshapeToBaserow.py
