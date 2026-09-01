@@ -1336,6 +1336,74 @@ class RecordBuildingTests(unittest.TestCase):
 
 
 class MultiRootSyncTests(unittest.TestCase):
+    def test_bad_list_root_is_logged_and_remaining_root_syncs(self):
+        bad_target = target()
+        good_target = MODULE.OnshapeTarget(
+            "https://cad.onshape.com", "1" * 24, "w", "2" * 24, "3" * 24
+        )
+        good_release = MODULE.released_assembly_from_revision(
+            revision(
+                "D",
+                "4" * 24,
+                documentId="1" * 24,
+                elementId="3" * 24,
+                partNumber="A-ROOT-TWO",
+            )
+        )
+        good_rows = [
+            {
+                "item": "1",
+                "quantity": 1,
+                "partNumber": "P-190B-260102",
+                "name": "TWO",
+                "revision": "E",
+                "itemSource": source("https://example/two", 0),
+            }
+        ]
+
+        with patch.object(
+            MODULE,
+            "resolve_latest_released_assembly",
+            side_effect=[RuntimeError("invalid latest-revision response"), good_release],
+        ), patch.object(
+            MODULE, "fetch_bom", return_value=good_rows
+        ), patch.object(
+            MODULE, "drawing_urls_for_parts", return_value=({}, [])
+        ), patch("builtins.print") as printed:
+            result = MODULE.run_sync(
+                [bad_target, good_target], ["P-190B-26"], dry_run=True
+            )
+
+        warning = next(
+            item for item in result["warnings"] if "could not be resolved" in item
+        )
+        self.assertIn(MODULE.onshape_target_url(bad_target), warning)
+        self.assertIn("RuntimeError: invalid latest-revision response", warning)
+        self.assertIn("existing Baserow requirements were left unchanged", warning)
+        self.assertTrue(
+            any(
+                call.args
+                and str(call.args[0]).startswith("WARNING: Manufacturing root ")
+                for call in printed.call_args_list
+            )
+        )
+        self.assertEqual(len(result["source_revisions"]), 1)
+        self.assertEqual(
+            result["source_revisions"][0]["part_number"], "A-ROOT-TWO"
+        )
+
+    def test_all_bad_list_roots_fail_before_baserow(self):
+        with patch.object(
+            MODULE,
+            "resolve_latest_released_assembly",
+            side_effect=RuntimeError("invalid latest-revision response"),
+        ), patch.object(
+            MODULE,
+            "sync_to_baserow",
+            side_effect=AssertionError("Baserow called"),
+        ), self.assertRaisesRegex(RuntimeError, "Baserow was not changed"):
+            MODULE.run_sync([target()], ["P-190B-26"])
+
     def test_no_released_direct_children_fails_before_baserow(self):
         with patch.object(MODULE, "fetch_bom", return_value=[]), patch.object(
             MODULE,

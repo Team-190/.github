@@ -16,6 +16,11 @@ and every resolved root gets an Assemblies row even when it has no matching
 production parts. A manual `subassembly_urls` input can replace the configured
 list with one or more comma- or newline-separated URLs.
 
+If one configured URL cannot be resolved, list mode logs a warning containing
+the exact URL and error, skips that root, and continues syncing the others. The
+skipped root's existing Baserow requirements are left unchanged. If none of the
+configured roots can be resolved, the run fails before changing Baserow.
+
 When `USE_SUBASSEMBLY_LIST=false`, and in the Delta workflow,
 `ONSHAPE_DOC_URL` points to the master assembly tab in Main. The master does not
 need to be released. Its workspace BOM is used only to discover direct `A-...`

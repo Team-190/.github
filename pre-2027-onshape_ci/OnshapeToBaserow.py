@@ -2127,6 +2127,18 @@ def run_sync(
         master_target = None
     else:
         for root_target in targets:
+            try:
+                released = resolve_latest_released_assembly(root_target)
+            except Exception as exc:
+                warning = (
+                    "Manufacturing root "
+                    f"{onshape_target_url(root_target)} could not be resolved and "
+                    "was skipped; existing Baserow requirements were left "
+                    f"unchanged. {type(exc).__name__}: {exc}"
+                )
+                warning_items.append(warning)
+                print(f"WARNING: {warning}", flush=True)
+                continue
             root_sources.append(
                 (
                     OnshapeDocumentReference(
@@ -2135,8 +2147,13 @@ def run_sync(
                         root_target.wvm_type,
                         root_target.wvm_id,
                     ),
-                    resolve_latest_released_assembly(root_target),
+                    released,
                 )
+            )
+        if not root_sources:
+            raise RuntimeError(
+                "No configured manufacturing roots could be resolved; "
+                "Baserow was not changed"
             )
 
     for root_reference, released in root_sources:
