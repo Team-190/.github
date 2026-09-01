@@ -39,7 +39,7 @@ concurrency:
 
 env:
   DEFAULT_ONSHAPE_SUBASSEMBLY_URLS: |-
-    https://frc190.onshape.com/documents/0b93a945f55626752d97aece/w/2702276d5f65f473e96092c1/e/bae881f75f307113a9bb5d23
+    https://frc190.onshape.com/documents/0b93a945f55626752d97aece/w/2702276d5f65f473e96092c1/e/29cefa513e5d1d9883644c29
     https://frc190.onshape.com/documents/e6a03477fcf74dae02a191b5/w/af849f9a5aae8b198e57dc0d/e/e8cdd43e3043c566dad73817
     https://frc190.onshape.com/documents/a954232c9b6c463860aa96c4/w/3b807be2adbfbd1312b0fbad/e/bf82f03d4a60b091329121ab
     https://frc190.onshape.com/documents/0a0e6617e29d1bda5890611e/w/04004edc4b82879957dffa36/e/2ce7e421f9400768aa94f692
