@@ -14,8 +14,6 @@ on:
         type: string
   repository_dispatch:
     types: [bom_sync_delta_baserow]
-  schedule:
-    - cron: "7,22,37,52 * * * *"
 
 concurrency:
   group: >-
