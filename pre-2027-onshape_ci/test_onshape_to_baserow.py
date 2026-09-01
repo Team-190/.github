@@ -22,8 +22,9 @@ def source(url, indent=1):
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self.payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
         pass
@@ -157,6 +158,19 @@ def revision(revision_name, version_id, **overrides):
     return item
 
 
+def drawing_revision(part_number, document_id, version_id, element_id, **overrides):
+    item = {
+        "documentId": document_id,
+        "elementId": element_id,
+        "elementType": MODULE.DRAWING_ELEMENT_TYPE,
+        "partNumber": part_number,
+        "revision": "A",
+        "versionId": version_id,
+    }
+    item.update(overrides)
+    return item
+
+
 class ReleaseResolutionTests(unittest.TestCase):
     def test_document_url_preserves_configuration(self):
         parsed = MODULE.parse_onshape_doc_url(
@@ -225,20 +239,94 @@ class ReleaseResolutionTests(unittest.TestCase):
 
         self.assertEqual(get_json.call_count, 1)
 
-    def test_manufacturing_root_urls_accept_json_and_newlines(self):
-        first = f"https://cad.onshape.com/documents/{DID}/w/{WID}/e/{EID}"
-        second = (
-            f"https://cad.onshape.com/documents/{RELEASE_DID}/w/{WID}/e/"
-            f"{RELEASE_EID}"
-        )
+    def test_master_discovery_resolves_only_direct_released_children(self):
+        direct_did = "1" * 24
+        nested_did = "2" * 24
+        unreleased_did = "3" * 24
+        rows = [
+            {
+                "name": "A-DIRECT",
+                "partNumber": "N/A",
+                "indentLevel": 0,
+                "itemSource": {
+                    "documentId": direct_did,
+                    "wvmType": "w",
+                    "wvmId": "4" * 24,
+                },
+            },
+            {
+                "name": "A-NESTED",
+                "partNumber": "N/A",
+                "indentLevel": 1,
+                "itemSource": {
+                    "documentId": nested_did,
+                    "wvmType": "v",
+                    "wvmId": "5" * 24,
+                },
+            },
+            {
+                "name": "A-DIRECT",
+                "partNumber": "N/A",
+                "indentLevel": 0,
+                "itemSource": {
+                    "documentId": direct_did,
+                    "wvmType": "v",
+                    "wvmId": "9" * 24,
+                },
+            },
+            {
+                "name": "A-UNRELEASED",
+                "partNumber": "N/A",
+                "indentLevel": 0,
+                "itemSource": {
+                    "documentId": unreleased_did,
+                    "wvmType": "w",
+                    "wvmId": "6" * 24,
+                },
+            },
+        ]
+
+        def latest(reference, part_number):
+            if part_number == "A-UNRELEASED":
+                return None
+            return revision(
+                "B",
+                "7" * 24,
+                documentId=reference.did,
+                elementId="8" * 24,
+                partNumber=part_number,
+            )
+
+        with patch.object(
+            MODULE,
+            "fetch_latest_discovered_assembly_revision",
+            side_effect=latest,
+        ) as fetch_latest:
+            roots, warnings = MODULE.discover_released_manufacturing_roots(
+                target(), rows
+            )
+
+        self.assertEqual([root.part_number for _, root in roots], ["A-DIRECT"])
         self.assertEqual(
-            MODULE.configured_onshape_urls(json.dumps([first, second, first])),
-            [first, second],
+            {call.args[1] for call in fetch_latest.call_args_list},
+            {"A-DIRECT", "A-UNRELEASED"},
         )
-        self.assertEqual(
-            MODULE.configured_onshape_urls(f"{first}\n{second}"),
-            [first, second],
+        self.assertTrue(any("A-UNRELEASED" in warning for warning in warnings))
+        self.assertFalse(any("A-NESTED" in warning for warning in warnings))
+
+    def test_discovered_child_without_release_handles_204(self):
+        reference = MODULE.OnshapeDocumentReference(
+            "https://frc190.onshape.com", "1" * 24, "w", "2" * 24
         )
+        with patch.object(
+            MODULE.requests, "get", return_value=FakeResponse(None, 204), create=True
+        ) as get, patch.object(MODULE, "onshape_headers", return_value={}):
+            latest = MODULE.fetch_latest_discovered_assembly_revision(
+                reference, "A-DIRECT"
+            )
+
+        self.assertIsNone(latest)
+        self.assertIn("/p/A-DIRECT/latest?et=1", get.call_args.args[0])
 
     def test_bom_is_fetched_from_immutable_released_version(self):
         released = MODULE.released_assembly_from_revision(
@@ -265,6 +353,18 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertNotIn(f"/w/{WID}/", requested_url)
         self.assertIn("configuration=Kicker+Position%3DFree", requested_url)
         self.assertEqual(rows[0]["partNumber"], "P-190B-260001")
+
+    def test_master_workspace_discovery_generates_bom_if_absent(self):
+        response = FakeResponse(
+            {"bomTable": {"items": [{"name": "A-DIRECT", "partNumber": "N/A"}]}}
+        )
+        with patch.object(MODULE, "onshape_headers", return_value={}), patch.object(
+            MODULE.requests, "get", return_value=response, create=True
+        ) as get:
+            rows = MODULE.fetch_bom(target(), generate_if_absent=True)
+
+        self.assertIn("generateIfAbsent=true", get.call_args.args[0])
+        self.assertEqual(rows[0]["name"], "A-DIRECT")
 
     def test_v16_bom_headers_and_rows_are_normalized(self):
         payload = v16_bom_response()
@@ -373,10 +473,13 @@ class ReleaseResolutionTests(unittest.TestCase):
 
 
 class DrawingLinkTests(unittest.TestCase):
-    def test_document_elements_are_cached_per_released_document_version(self):
+    def test_discovery_and_release_lookup_are_cached_per_document(self):
         part_did = "1" * 24
         part_vid = "2" * 24
         drawing_eid = "4" * 24
+        released_did = "6" * 24
+        released_vid = "7" * 24
+        released_eid = "8" * 24
         item_source = {
             "documentId": part_did,
             "wvmType": "v",
@@ -403,16 +506,24 @@ class DrawingLinkTests(unittest.TestCase):
 
         with patch.object(
             MODULE, "fetch_document_elements", return_value=elements
-        ) as fetch_elements:
+        ) as fetch_elements, patch.object(
+            MODULE,
+            "fetch_latest_drawing_revision",
+            return_value=drawing_revision(
+                "P-190B-260100", released_did, released_vid, released_eid
+            ),
+        ) as fetch_revision:
             drawing_urls, warnings = MODULE.drawing_urls_for_parts(
                 rows, ["P-190B-26"], "https://cad.onshape.com"
             )
 
         self.assertEqual(fetch_elements.call_count, 1)
+        self.assertEqual(fetch_revision.call_count, 1)
         self.assertEqual(warnings, [])
         self.assertEqual(
             drawing_urls["P-190B-260100"],
-            f"https://cad.onshape.com/documents/{part_did}/v/{part_vid}/e/{drawing_eid}",
+            f"https://cad.onshape.com/documents/{released_did}/v/{released_vid}/e/"
+            f"{released_eid}",
         )
 
     def test_drawing_metadata_part_number_matches_when_tab_name_does_not(self):
@@ -447,7 +558,13 @@ class DrawingLinkTests(unittest.TestCase):
             MODULE, "fetch_document_elements", return_value=elements
         ), patch.object(
             MODULE, "fetch_element_metadata", return_value=metadata
-        ) as fetch_metadata:
+        ) as fetch_metadata, patch.object(
+            MODULE,
+            "fetch_latest_drawing_revision",
+            return_value=drawing_revision(
+                "P-190B-260100", "5" * 24, "6" * 24, "7" * 24
+            ),
+        ):
             drawing_urls, warnings = MODULE.drawing_urls_for_parts(
                 rows, ["P-190B-26"], "https://frc190.onshape.com"
             )
@@ -494,6 +611,12 @@ class DrawingLinkTests(unittest.TestCase):
                     {"name": "Part number", "value": "P-190B-260764"}
                 ]
             },
+        ), patch.object(
+            MODULE,
+            "fetch_latest_drawing_revision",
+            return_value=drawing_revision(
+                "P-190B-260764", "6" * 24, "7" * 24, "8" * 24
+            ),
         ):
             drawing_urls, warnings = MODULE.drawing_urls_for_parts(
                 rows,
@@ -505,29 +628,48 @@ class DrawingLinkTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(
             drawing_urls["P-190B-260764"],
-            f"https://frc190.onshape.com/documents/{released_reference.did}/"
-            f"v/{released_reference.wvm_id}/e/{drawing_eid}",
+            f"https://frc190.onshape.com/documents/{'6' * 24}/"
+            f"v/{'7' * 24}/e/{'8' * 24}",
         )
 
     def test_multiple_matching_drawings_warn_and_leave_link_blank(self):
-        part_did = "1" * 24
-        part_vid = "2" * 24
+        first_did = "1" * 24
+        second_did = "2" * 24
         rows = [
             {
                 "partNumber": "P-190B-260100",
                 "itemSource": {
-                    "documentId": part_did,
+                    "documentId": first_did,
                     "wvmType": "v",
-                    "wvmId": part_vid,
+                    "wvmId": "3" * 24,
                 },
-            }
+            },
+            {
+                "partNumber": "P-190B-260100",
+                "itemSource": {
+                    "documentId": second_did,
+                    "wvmType": "v",
+                    "wvmId": "4" * 24,
+                },
+            },
         ]
         elements = [
-            {"id": "3" * 24, "name": "P-190B-260100", "elementType": "DRAWING"},
-            {"id": "4" * 24, "name": "P-190B-260100", "elementType": "DRAWING"},
+            {"id": "5" * 24, "name": "P-190B-260100", "elementType": "DRAWING"},
         ]
 
-        with patch.object(MODULE, "fetch_document_elements", return_value=elements):
+        def latest_for(reference, part_number):
+            return drawing_revision(
+                part_number,
+                reference.did,
+                "6" * 24 if reference.did == first_did else "7" * 24,
+                "8" * 24 if reference.did == first_did else "9" * 24,
+            )
+
+        with patch.object(
+            MODULE, "fetch_document_elements", return_value=elements
+        ), patch.object(
+            MODULE, "fetch_latest_drawing_revision", side_effect=latest_for
+        ):
             drawing_urls, warnings = MODULE.drawing_urls_for_parts(
                 rows, ["P-190B-26"], "https://cad.onshape.com"
             )
@@ -536,7 +678,7 @@ class DrawingLinkTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("Multiple released drawings", warnings[0])
 
-    def test_released_document_match_wins_over_workspace_source_match(self):
+    def test_workspace_and_assembly_snapshots_resolve_to_drawing_own_release(self):
         workspace_reference = MODULE.OnshapeDocumentReference(
             "https://frc190.onshape.com", "1" * 24, "w", "2" * 24
         )
@@ -562,6 +704,9 @@ class DrawingLinkTests(unittest.TestCase):
             }
         ]
 
+        own_did = "5" * 24
+        own_vid = "6" * 24
+        own_eid = "7" * 24
         with patch.object(
             MODULE, "fetch_document_elements", return_value=elements
         ), patch.object(
@@ -572,7 +717,13 @@ class DrawingLinkTests(unittest.TestCase):
                     {"name": "Part number", "value": "P-190B-260764"}
                 ]
             },
-        ):
+        ), patch.object(
+            MODULE,
+            "fetch_latest_drawing_revision",
+            return_value=drawing_revision(
+                "P-190B-260764", own_did, own_vid, own_eid
+            ),
+        ) as fetch_revision:
             drawing_urls, warnings = MODULE.drawing_urls_for_parts(
                 rows,
                 ["P-190B-26"],
@@ -581,11 +732,53 @@ class DrawingLinkTests(unittest.TestCase):
             )
 
         self.assertEqual(warnings, [])
+        self.assertEqual(fetch_revision.call_count, 1)
         self.assertEqual(
             drawing_urls["P-190B-260764"],
-            f"https://frc190.onshape.com/documents/{released_reference.did}/"
-            f"v/{released_reference.wvm_id}/e/{drawing_eid}",
+            f"https://frc190.onshape.com/documents/{own_did}/"
+            f"v/{own_vid}/e/{own_eid}",
         )
+
+    def test_unreleased_drawing_is_not_used_as_pdf_source(self):
+        part_number = "P-190B-260100"
+        rows = [
+            {
+                "partNumber": part_number,
+                "itemSource": {
+                    "documentId": "1" * 24,
+                    "wvmType": "w",
+                    "wvmId": "2" * 24,
+                },
+            }
+        ]
+        elements = [
+            {"id": "3" * 24, "name": part_number, "elementType": "DRAWING"}
+        ]
+
+        with patch.object(
+            MODULE, "fetch_document_elements", return_value=elements
+        ), patch.object(MODULE, "fetch_latest_drawing_revision", return_value=None):
+            drawing_urls, warnings = MODULE.drawing_urls_for_parts(
+                rows, ["P-190B-26"], "https://cad.onshape.com"
+            )
+
+        self.assertNotIn(part_number, drawing_urls)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("No released drawing revision", warnings[0])
+
+    def test_latest_drawing_revision_uses_drawing_type_and_handles_204(self):
+        reference = MODULE.OnshapeDocumentReference(
+            "https://frc190.onshape.com", "1" * 24, "v", "2" * 24
+        )
+        with patch.object(
+            MODULE.requests, "get", return_value=FakeResponse(None, 204), create=True
+        ) as get, patch.object(MODULE, "onshape_headers", return_value={}):
+            latest = MODULE.fetch_latest_drawing_revision(
+                reference, "P-190B-260100"
+            )
+
+        self.assertIsNone(latest)
+        self.assertIn("/p/P-190B-260100/latest?et=2", get.call_args.args[0])
 
 
 class FileExportTests(unittest.TestCase):
@@ -849,6 +1042,85 @@ class RecordBuildingTests(unittest.TestCase):
 
 
 class MultiRootSyncTests(unittest.TestCase):
+    def test_no_released_direct_children_fails_before_baserow(self):
+        with patch.object(MODULE, "fetch_bom", return_value=[]), patch.object(
+            MODULE,
+            "sync_to_baserow",
+            side_effect=AssertionError("Baserow called"),
+        ), self.assertRaisesRegex(RuntimeError, "Baserow was not changed"):
+            MODULE.run_sync(
+                target(), ["P-190B-26"], discover_from_master=True
+            )
+
+    def test_unreleased_master_discovers_child_release_without_being_released(self):
+        child_did = "1" * 24
+        child_eid = "2" * 24
+        child_vid = "3" * 24
+        master_rows = [
+            {
+                "name": "A-ROOT-ONE",
+                "partNumber": "N/A",
+                "revision": "",
+                "indentLevel": 0,
+                "itemSource": {
+                    "documentId": child_did,
+                    "elementId": child_eid,
+                    "wvmType": "w",
+                    "wvmId": "4" * 24,
+                },
+            }
+        ]
+        child_rows = [
+            {
+                "item": "1",
+                "quantity": 2,
+                "partNumber": "P-190B-260101",
+                "name": "PLATE",
+                "revision": "C",
+                "itemSource": source("https://example/plate", 0),
+            }
+        ]
+        child_release = revision(
+            "B",
+            child_vid,
+            documentId=child_did,
+            elementId=child_eid,
+            partNumber="A-ROOT-ONE",
+        )
+
+        with patch.object(
+            MODULE, "fetch_bom", side_effect=[master_rows, child_rows]
+        ), patch.object(
+            MODULE,
+            "fetch_latest_discovered_assembly_revision",
+            return_value=child_release,
+        ), patch.object(
+            MODULE,
+            "resolve_latest_released_assembly",
+            side_effect=AssertionError("master release was resolved"),
+        ), patch.object(
+            MODULE, "drawing_urls_for_parts", return_value=({}, [])
+        ):
+            result = MODULE.run_sync(
+                target(),
+                ["P-190B-26"],
+                dry_run=True,
+                discover_from_master=True,
+            )
+
+        self.assertIsNone(result["master_baseline_revision"])
+        self.assertEqual(result["master_workspace_rows"], 1)
+        self.assertEqual(len(result["requirements"]), 1)
+        self.assertEqual(result["requirements"][0]["Source Root"], "A-ROOT-ONE")
+        self.assertEqual(
+            result["assemblies"][0]["Integration Status"],
+            "Discovered — Master Unreleased",
+        )
+        self.assertEqual(
+            result["assemblies"][0]["Discovery Master"],
+            f"https://cad.onshape.com/documents/{DID}/w/{WID}/e/{EID}",
+        )
+
     def test_independent_roots_use_master_only_for_revision_comparison(self):
         root_one_target = target()
         root_two_target = MODULE.OnshapeTarget(
@@ -966,7 +1238,13 @@ class MultiRootSyncTests(unittest.TestCase):
             def __init__(self):
                 self.rows = {
                     table_ids["assemblies"]: [
-                        {"id": 11, "Assembly Number": "A-ROOT-TWO", "Active": True},
+                        {
+                            "id": 11,
+                            "Assembly Number": "A-ROOT-TWO",
+                            "Active": True,
+                            "Discovery Master": "https://example/master",
+                            "Integration Status": "Discovered — Master Unreleased",
+                        },
                     ],
                     table_ids["parts"]: [{"id": 20, **desired_part}],
                     table_ids["requirements"]: [
@@ -1059,6 +1337,7 @@ class MultiRootSyncTests(unittest.TestCase):
                 exports_by_part={},
                 sync_cad_files=False,
                 synced_roots={"A-ROOT-ONE"},
+                discovery_master="https://example/master",
             )
 
         requirement_updates = [
@@ -1073,6 +1352,19 @@ class MultiRootSyncTests(unittest.TestCase):
             if row.get("Active in BOM") is False
         }
         self.assertEqual(deactivated_ids, {30, 32})
+        assembly_updates = [
+            row
+            for table_id, rows in client.updates
+            if table_id == table_ids["assemblies"]
+            for row in rows
+        ]
+        self.assertIn(
+            {
+                "id": 11,
+                "Integration Status": "Missing from Main — Review",
+            },
+            assembly_updates,
+        )
         root_row = next(
             row
             for row in client.rows[table_ids["assemblies"]]

@@ -16,19 +16,20 @@ gh workflow run onshape_baserow_delta.yml --ref <implementation-branch> -f dry_r
 gh workflow run onshape_baserow_poot_horse.yml --ref <implementation-branch> -f dry_run=true
 ```
 
-Each command checks out the selected branch, resolves every configured released
-manufacturing-root BOM and the master comparison baseline, and uploads the
-resulting JSON. The isolated dry-run job has no Baserow
+Each command checks out the selected branch, reads the unreleased master
+workspace to discover direct child assemblies, resolves each child's latest
+released BOM, and uploads the resulting JSON. The isolated dry-run job has no Baserow
 URL, token, or table IDs. Manual production jobs can run only from the default
 branch, while scheduled production syncs are unchanged.
 
-Release resolution reads each tracked Main manufacturing root's Part number and
-calls the Onshape latest-revision API for that assembly part number. The revision's own
-immutable document/version/element/configuration coordinates—not a possibly
-missing configuration query in the Main URL—define the BOM baseline.
+The master workspace is discovery input only and does not define the production
+BOM. Each direct child's assembly number and source document are used to call
+the Onshape latest-revision API. The child revision's immutable
+document/version/element/configuration coordinates define its manufacturing
+baseline.
 
-For example, A-26C-0004 can be treated as the tracked root for a one-off release
-resolution test without changing the poot_horse production secret:
+For example, another master workspace can be tested without changing the
+poot_horse production secret:
 
 ```text
 gh workflow run onshape_baserow_poot_horse.yml \
@@ -37,13 +38,12 @@ gh workflow run onshape_baserow_poot_horse.yml \
   -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
 ```
 
-The URL override is consumed as the sole manufacturing root by manual workflow
-runs, including production runs from the default branch. If omitted, the
-workflow uses its `ONSHAPE_MANUFACTURING_ROOT_URLS_*` JSON-array secret. The
-existing `ONSHAPE_DOC_URL_*` secret remains the master comparison baseline.
-Scheduled and repository-dispatch production runs always use the configured
-root list. Because `dry_run=false` writes to Baserow, validate the same override
-with a dry run before using it for production.
+The URL override is consumed as the discovery master by manual workflow runs,
+including production runs from the default branch. If omitted, the workflow
+uses its existing `ONSHAPE_DOC_URL_*` Main-workspace secret. Scheduled and
+repository-dispatch production runs always use that secret. Because
+`dry_run=false` writes to Baserow, validate the same override with a dry run
+before using it for production.
 
 After validation, a default-branch production override can be dispatched with:
 

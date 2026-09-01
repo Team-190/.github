@@ -28,6 +28,7 @@ ASSEMBLY_NAME_RE = re.compile(r"^A-[A-Za-z0-9-]+$")
 BATCH_SIZE = 100
 ONSHAPE_API_VERSION = "v16"
 ASSEMBLY_ELEMENT_TYPE = 1
+DRAWING_ELEMENT_TYPE = 2
 CAD_EXPORT_CACHE_VERSION = "v2"
 DRAWING_PDF_FIELD = "Drawing PDF"
 DRAWING_PDF_KEY_FIELD = "Drawing PDF Export Key"
@@ -144,25 +145,6 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def configured_onshape_urls(value: str) -> list[str]:
-    """Parse a JSON array, newline list, or single configured Onshape URL."""
-    raw = str(value or "").strip()
-    if not raw:
-        return []
-    if raw.startswith("["):
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list) or not all(
-            isinstance(item, str) for item in parsed
-        ):
-            raise ValueError(
-                "ONSHAPE_MANUFACTURING_ROOT_URLS must be a JSON array of URLs"
-            )
-        urls = [item.strip() for item in parsed if item.strip()]
-    else:
-        urls = [line.strip() for line in raw.splitlines() if line.strip()]
-    return list(dict.fromkeys(urls))
-
-
 def parse_onshape_doc_url(doc_url: str) -> OnshapeTarget:
     parsed = urlparse(doc_url.strip())
     match = re.search(
@@ -222,6 +204,18 @@ def onshape_headers(method: str, full_url: str) -> dict[str, str]:
 def onshape_get_json(url: str) -> dict:
     response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
     response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected Onshape response from {url}: expected an object")
+    return payload
+
+
+def onshape_get_optional_json(url: str) -> dict | None:
+    """Return an Onshape JSON object, or None for a successful 204 response."""
+    response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
+    response.raise_for_status()
+    if response.status_code == 204:
+        return None
     payload = response.json()
     if not isinstance(payload, dict):
         raise RuntimeError(f"Unexpected Onshape response from {url}: expected an object")
@@ -306,6 +300,74 @@ def fetch_latest_assembly_revision(
     )
     return onshape_get_json(
         f"{endpoint}?{urlencode({'et': ASSEMBLY_ELEMENT_TYPE})}"
+    )
+
+
+def fetch_latest_discovered_assembly_revision(
+    reference: OnshapeDocumentReference, part_number: str
+) -> dict | None:
+    """Fetch a discovered child assembly's latest release, allowing no release."""
+    encoded_part_number = quote(part_number, safe="")
+    endpoint = (
+        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/revisions/d/"
+        f"{reference.did}/p/{encoded_part_number}/latest"
+    )
+    return onshape_get_optional_json(
+        f"{endpoint}?{urlencode({'et': ASSEMBLY_ELEMENT_TYPE})}"
+    )
+
+
+def fetch_latest_drawing_revision(
+    reference: OnshapeDocumentReference, part_number: str
+) -> dict | None:
+    """Fetch the latest released drawing revision for a company-owned part number."""
+    encoded_part_number = quote(part_number, safe="")
+    endpoint = (
+        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/revisions/d/{reference.did}/"
+        f"p/{encoded_part_number}/latest"
+    )
+    return onshape_get_optional_json(
+        f"{endpoint}?{urlencode({'et': DRAWING_ELEMENT_TYPE})}"
+    )
+
+
+def released_drawing_url(
+    reference: OnshapeDocumentReference, part_number: str, latest: dict
+) -> str:
+    """Build an immutable URL from a drawing's own revision record."""
+    if latest.get("elementType") not in (None, DRAWING_ELEMENT_TYPE):
+        raise RuntimeError(
+            f"Latest drawing revision for {part_number} is not a drawing"
+        )
+    returned_part_number = str(latest.get("partNumber") or "").strip()
+    if (
+        returned_part_number
+        and normalized_part_number(returned_part_number)
+        != normalized_part_number(part_number)
+    ):
+        raise RuntimeError(
+            "Onshape latest drawing revision returned a different part number for "
+            f"{part_number}"
+        )
+
+    required_ids = {
+        "documentId": "document",
+        "elementId": "element",
+        "versionId": "immutable version",
+    }
+    resolved_ids = {
+        field: str(latest.get(field) or "").strip() for field in required_ids
+    }
+    missing = [label for field, label in required_ids.items() if not resolved_ids[field]]
+    if missing:
+        raise RuntimeError(
+            f"Latest released drawing revision for {part_number} has no "
+            + ", ".join(missing)
+            + " ID"
+        )
+    return (
+        f"{reference.base_url}/documents/{resolved_ids['documentId']}/"
+        f"v/{resolved_ids['versionId']}/e/{resolved_ids['elementId']}"
     )
 
 
@@ -417,7 +479,9 @@ def bom_rows_from_container(container: dict) -> list[dict] | None:
     return None
 
 
-def fetch_bom(target: OnshapeTarget) -> list[dict]:
+def fetch_bom(
+    target: OnshapeTarget, *, generate_if_absent: bool = False
+) -> list[dict]:
     endpoint = (
         f"{target.base_url}/api/{ONSHAPE_API_VERSION}/assemblies/d/{target.did}/"
         f"{target.wvm_type}/{target.wvm_id}/e/{target.eid}/bom"
@@ -425,7 +489,7 @@ def fetch_bom(target: OnshapeTarget) -> list[dict]:
     params = {
         "indented": "true",
         "multiLevel": "true",
-        "generateIfAbsent": "false",
+        "generateIfAbsent": "true" if generate_if_absent else "false",
         "includeItemMicroversions": "false",
         "includeTopLevelAssemblyRow": "false",
         "thumbnail": "false",
@@ -572,6 +636,76 @@ def normalized_part_number(value) -> str:
     return str(value or "").strip().casefold()
 
 
+def discover_released_manufacturing_roots(
+    master_target: OnshapeTarget, items: list[dict]
+) -> tuple[list[tuple[OnshapeDocumentReference, ReleasedAssembly]], list[str]]:
+    """Resolve direct child assemblies in Main to their own latest releases."""
+    candidates: dict[str, set[OnshapeDocumentReference]] = {}
+    warnings: list[str] = []
+    for row in items:
+        if not is_assembly_row(row) or indent_level(row) != 0:
+            continue
+        assembly_number = str(row.get("name") or "").strip()
+        reference = source_document_reference(
+            row.get("itemSource"), master_target.base_url
+        )
+        if reference is None:
+            warnings.append(
+                f"Could not resolve the source document for direct child "
+                f"{assembly_number}; manufacturing root skipped"
+            )
+            continue
+        candidates.setdefault(assembly_number, set()).add(reference)
+
+    roots: list[tuple[OnshapeDocumentReference, ReleasedAssembly]] = []
+    for assembly_number in sorted(candidates):
+        references = candidates[assembly_number]
+        document_keys = {
+            (reference.base_url, reference.did) for reference in references
+        }
+        if len(document_keys) != 1:
+            warnings.append(
+                f"Direct child {assembly_number} resolves to multiple documents; "
+                "manufacturing root skipped"
+            )
+            continue
+        reference = sorted(
+            references,
+            key=lambda item: (
+                item.base_url,
+                item.did,
+                item.wvm_type,
+                item.wvm_id,
+            ),
+        )[0]
+        latest = fetch_latest_discovered_assembly_revision(
+            reference, assembly_number
+        )
+        if not latest or not str(latest.get("versionId") or "").strip():
+            warnings.append(
+                f"Direct child {assembly_number} has no released assembly revision; "
+                "existing Baserow requirements were left unchanged"
+            )
+            continue
+        released = released_assembly_from_revision(latest)
+        if (
+            released.part_number
+            and normalized_part_number(released.part_number)
+            != normalized_part_number(assembly_number)
+        ):
+            raise RuntimeError(
+                "Onshape latest-revision response returned a different part number "
+                f"for discovered child {assembly_number}"
+            )
+        roots.append((reference, released))
+
+    if not candidates:
+        warnings.append(
+            "The master workspace BOM contains no direct A-... child assemblies"
+        )
+    return roots, sorted(set(warnings))
+
+
 def is_drawing_element(element: dict) -> bool:
     element_type = str(
         element.get("elementType") or element.get("type") or ""
@@ -598,7 +732,7 @@ def drawing_urls_for_parts(
     default_base_url: str,
     extra_references: list[OnshapeDocumentReference] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Find released drawing tabs whose metadata part number matches a BOM part."""
+    """Find drawing tabs, then resolve each PDF source to its own latest release."""
     expected_by_reference: dict[OnshapeDocumentReference, dict[str, str]] = {}
     all_expected: dict[str, str] = {}
     for row in items:
@@ -615,12 +749,10 @@ def drawing_urls_for_parts(
             normalized_part_number(part_number)
         ] = part_number
 
-    preferred_references = set(extra_references or [])
-    for reference in preferred_references:
+    for reference in set(extra_references or []):
         expected_by_reference.setdefault(reference, {}).update(all_expected)
 
-    preferred_matches: dict[str, set[str]] = {}
-    fallback_matches: dict[str, set[str]] = {}
+    drawing_candidates: dict[str, set[OnshapeDocumentReference]] = {}
     for reference, expected in expected_by_reference.items():
         for element in fetch_document_elements(reference):
             if not is_drawing_element(element):
@@ -641,24 +773,33 @@ def drawing_urls_for_parts(
                 part_number = expected.get(candidate_key)
                 if not part_number:
                     continue
-                url = (
-                    f"{reference.base_url}/documents/{reference.did}/"
-                    f"{reference.wvm_type}/{reference.wvm_id}/e/{element_id}"
-                )
-                match_bucket = (
-                    preferred_matches
-                    if reference in preferred_references
-                    else fallback_matches
-                )
-                match_bucket.setdefault(part_number, set()).add(url)
+                drawing_candidates.setdefault(part_number, set()).add(reference)
 
     drawing_urls: dict[str, str] = {}
     warnings: list[str] = []
-    matched_part_numbers = set(preferred_matches) | set(fallback_matches)
-    for part_number in sorted(matched_part_numbers):
-        urls = preferred_matches.get(part_number) or fallback_matches[part_number]
+    release_cache: dict[tuple[str, str, str], dict | None] = {}
+    for part_number in sorted(drawing_candidates):
+        urls: set[str] = set()
+        for reference in drawing_candidates[part_number]:
+            cache_key = (
+                reference.base_url,
+                reference.did,
+                normalized_part_number(part_number),
+            )
+            if cache_key not in release_cache:
+                release_cache[cache_key] = fetch_latest_drawing_revision(
+                    reference, part_number
+                )
+            latest = release_cache[cache_key]
+            if latest is not None:
+                urls.add(released_drawing_url(reference, part_number, latest))
         if len(urls) == 1:
             drawing_urls[part_number] = next(iter(urls))
+        elif not urls:
+            warnings.append(
+                f"No released drawing revision found for {part_number}; "
+                "drawing link left blank"
+            )
         else:
             warnings.append(
                 f"Multiple released drawings match {part_number}; drawing link left blank"
@@ -1224,6 +1365,7 @@ def sync_to_baserow(
     sync_cad_files: bool,
     assembly_records: list[dict] | None = None,
     synced_roots: set[str] | None = None,
+    discovery_master: str = "",
 ) -> dict:
     client = BaserowClient(require_env("BASEROW_API_URL"), require_env("BASEROW_TOKEN"))
     table_ids = {
@@ -1268,6 +1410,7 @@ def sync_to_baserow(
                 "Latest Released Revision",
                 "Master Baseline Revision",
                 "Integration Status",
+                "Discovery Master",
                 "Onshape Source",
                 "Last Synced At",
             )
@@ -1293,6 +1436,33 @@ def sync_to_baserow(
                     root_assembly_fields,
                 )
                 assembly_rows = client.list_rows(table_ids["assemblies"])
+
+        missing_from_master = []
+        if discovery_master and assembly_rows:
+            available_assembly_fields = {
+                field for row in assembly_rows for field in row
+            }
+            if {
+                "Discovery Master",
+                "Integration Status",
+            }.issubset(available_assembly_fields):
+                missing_from_master = [
+                    {
+                        "id": row["id"],
+                        "Integration Status": "Missing from Main — Review",
+                    }
+                    for row in assembly_rows
+                    if str(row.get("Discovery Master") or "").strip()
+                    == discovery_master
+                    and str(row.get("Assembly Number") or "").strip()
+                    not in synced_roots
+                    and str(row.get("Integration Status") or "").strip()
+                    != "Missing from Main — Review"
+                ]
+                if missing_from_master:
+                    client.batch_update(
+                        table_ids["assemblies"], missing_from_master
+                    )
         assembly_ids = {str(r.get("Assembly Number") or ""): r["id"] for r in assembly_rows}
 
         part_rows = client.list_rows(table_ids["parts"])
@@ -1444,6 +1614,7 @@ def sync_to_baserow(
             "updated": updated,
             "unchanged": unchanged,
             "deactivated": len(deactivate),
+            "roots_missing_from_master": len(missing_from_master),
             "file_groups_uploaded": files_uploaded,
             "file_groups_cached": files_cached,
         }
@@ -1550,6 +1721,7 @@ def run_sync(
     output_json: str = "",
     sync_cad_files: bool = False,
     master_target: OnshapeTarget | None = None,
+    discover_from_master: bool = False,
 ) -> dict:
     targets = target if isinstance(target, list) else [target]
     if not targets:
@@ -1561,9 +1733,47 @@ def run_sync(
     warning_items: list[str] = []
     export_groups: list[dict[str, list[FileExport]]] = []
     seen_roots: set[str] = set()
+    discovery_master_url = ""
+    master_workspace_items: list[dict] = []
+    root_sources: list[tuple[OnshapeDocumentReference, ReleasedAssembly]] = []
 
-    for root_target in targets:
-        released = resolve_latest_released_assembly(root_target)
+    if discover_from_master:
+        if len(targets) != 1:
+            raise ValueError("Master discovery requires exactly one assembly URL")
+        discovery_target = targets[0]
+        if discovery_target.wvm_type != "w":
+            raise ValueError(
+                "The master discovery URL must point to an assembly in Main"
+            )
+        discovery_master_url = onshape_target_url(discovery_target)
+        master_workspace_items = fetch_bom(
+            discovery_target, generate_if_absent=True
+        )
+        root_sources, discovery_warnings = discover_released_manufacturing_roots(
+            discovery_target, master_workspace_items
+        )
+        warning_items.extend(discovery_warnings)
+        if not root_sources:
+            raise RuntimeError(
+                "No released direct-child manufacturing roots were discovered; "
+                "Baserow was not changed"
+            )
+        master_target = None
+    else:
+        for root_target in targets:
+            root_sources.append(
+                (
+                    OnshapeDocumentReference(
+                        root_target.base_url.rstrip("/"),
+                        root_target.did,
+                        root_target.wvm_type,
+                        root_target.wvm_id,
+                    ),
+                    resolve_latest_released_assembly(root_target),
+                )
+            )
+
+    for root_reference, released in root_sources:
         source_root = released.part_number.strip()
         if not source_root:
             raise RuntimeError(
@@ -1575,7 +1785,7 @@ def run_sync(
             )
         seen_roots.add(source_root)
 
-        released_target = released.bom_target(root_target.base_url)
+        released_target = released.bom_target(root_reference.base_url)
         raw_items = fetch_bom(released_target)
         root_parts, root_requirements, root_warnings = build_records(
             raw_items,
@@ -1586,7 +1796,7 @@ def run_sync(
         drawing_urls, drawing_warnings = drawing_urls_for_parts(
             raw_items,
             prefixes,
-            root_target.base_url,
+            root_reference.base_url,
             [
                 OnshapeDocumentReference(
                     released_target.base_url.rstrip("/"),
@@ -1607,11 +1817,11 @@ def run_sync(
                 raw_items,
                 drawing_urls,
                 prefixes,
-                root_target.base_url,
+                root_reference.base_url,
             )
         root_results.append(
             {
-                "target": root_target,
+                "reference": root_reference,
                 "released": released,
                 "items": raw_items,
                 "parts": root_parts,
@@ -1628,22 +1838,10 @@ def run_sync(
     master_items: list[dict] = []
     master_revisions: dict[str, str] = {}
     if master_target is not None:
-        matching_root = next(
-            (
-                result
-                for result in root_results
-                if result["target"] == master_target
-            ),
-            None,
+        master_released = resolve_latest_released_assembly(master_target)
+        master_items = fetch_bom(
+            master_released.bom_target(master_target.base_url)
         )
-        if matching_root:
-            master_released = matching_root["released"]
-            master_items = matching_root["items"]
-        else:
-            master_released = resolve_latest_released_assembly(master_target)
-            master_items = fetch_bom(
-                master_released.bom_target(master_target.base_url)
-            )
         master_revisions = assembly_revisions(master_items)
         if master_released.part_number:
             master_revisions[master_released.part_number] = master_released.revision
@@ -1659,13 +1857,20 @@ def run_sync(
                 "Active": True,
                 "Latest Released Revision": released.revision,
                 "Master Baseline Revision": master_revision,
-                "Integration Status": integration_status(
-                    released.revision,
-                    master_revision,
-                    master_target is not None,
+                "Integration Status": (
+                    "Discovered — Master Unreleased"
+                    if discover_from_master
+                    else integration_status(
+                        released.revision,
+                        master_revision,
+                        master_target is not None,
+                    )
                 ),
+                "Discovery Master": discovery_master_url,
                 "Onshape Source": released.view_ref
-                or onshape_target_url(released.bom_target(result["target"].base_url)),
+                or onshape_target_url(
+                    released.bom_target(result["reference"].base_url)
+                ),
                 "Last Synced At": utc_now(),
             }
         )
@@ -1707,6 +1912,8 @@ def run_sync(
                 master_released.as_dict() if master_released else None
             ),
             "master_baseline_assemblies": master_revisions,
+            "master_workspace_url": discovery_master_url or None,
+            "master_workspace_rows": len(master_workspace_items),
             "source_rows": sum(len(root["items"]) for root in root_results),
             "assemblies": assembly_records,
             "parts": parts,
@@ -1745,6 +1952,7 @@ def run_sync(
         sync_cad_files=sync_cad_files,
         assembly_records=assembly_records,
         synced_roots=seen_roots,
+        discovery_master=discovery_master_url,
     )
     print(json.dumps(summary, indent=2))
     return summary
@@ -1766,32 +1974,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    configured_roots = configured_onshape_urls(
-        os.environ.get("ONSHAPE_MANUFACTURING_ROOT_URLS", "")
-    )
-    if configured_roots:
-        targets = [parse_onshape_doc_url(url) for url in configured_roots]
-        master_url = (
-            os.environ.get("ONSHAPE_MASTER_DOC_URL", "").strip()
-            or require_env("ONSHAPE_DOC_URL")
-        )
-        master_target = parse_onshape_doc_url(master_url)
-    else:
-        targets = [parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))]
-        master_url = os.environ.get("ONSHAPE_MASTER_DOC_URL", "").strip()
-        master_target = parse_onshape_doc_url(master_url) if master_url else None
+    master_target = parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))
     prefixes = [
         p.strip()
         for p in os.environ.get("PARTNUMBER_PREFIXES", "").split(",")
         if p.strip()
     ]
     run_sync(
-        targets,
+        master_target,
         prefixes,
         dry_run=args.dry_run,
         output_json=args.output_json,
         sync_cad_files=environment_flag("SYNC_CAD_FILES"),
-        master_target=master_target,
+        discover_from_master=True,
     )
     return 0
 

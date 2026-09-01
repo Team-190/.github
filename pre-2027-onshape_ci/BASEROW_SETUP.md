@@ -4,26 +4,18 @@ The sync writes only engineering-owned fields. It never updates manufacturing
 status, machine, machinist, finishing, current location, QC outcome, or
 disposition on an existing production requirement.
 
-`ONSHAPE_DOC_URL` points to the master assembly tab in Main.
-`ONSHAPE_MANUFACTURING_ROOT_URLS` contains the independently releasable
-subassembly tabs whose latest released BOMs drive production. Store it as a JSON
-array of Main workspace URLs, for example:
+`ONSHAPE_DOC_URL` points to the master assembly tab in Main. The master does not
+need to be released. Its workspace BOM is used only to discover direct `A-...`
+child assemblies; nested assemblies are intentionally ignored so their parts
+are not counted twice.
 
-```json
-[
-  "https://frc190.onshape.com/documents/.../w/.../e/...",
-  "https://frc190.onshape.com/documents/.../w/.../e/..."
-]
-```
-
-For every manufacturing root, the sync reads its Part number, resolves its
-latest assembly revision (`et=1`), and reads that revision's immutable
-document/version/element/configuration coordinates. Direct child parts are
-assigned to the root assembly even though Onshape omits the top-level BOM row.
-The master BOM does not create production requirements; it only records which
-subassembly revisions have been incorporated into the released integration
-baseline. If `ONSHAPE_MANUFACTURING_ROOT_URLS` is empty, the sync retains the
-legacy single-root behavior and uses `ONSHAPE_DOC_URL` as the production root.
+For every discovered direct child, the sync uses the child row's source
+document and assembly number to resolve its latest released assembly revision
+(`et=1`). Production requirements are built only from that child's immutable
+released document/version/element/configuration coordinates. A child without a
+release is skipped with a warning, and its existing Baserow requirements are
+left unchanged. If no released direct children can be resolved, the run fails
+before changing Baserow.
 
 ## Required tables
 
@@ -46,8 +38,12 @@ Field names are API contracts and must match the names below exactly.
 - `Active` — boolean
 - `Latest Released Revision` — text
 - `Master Baseline Revision` — text
-- `Integration Status` — single select or text; `Not Compared`, `Not in Master`,
-  `Current in Master`, and `Newer Revision Available`
+- `Integration Status` — single select or text; include
+  `Discovered — Master Unreleased` and `Missing from Main — Review` (the legacy
+  comparison values `Not Compared`, `Not in Master`, `Current in Master`, and
+  `Newer Revision Available` may remain)
+- `Discovery Master` — URL or text; Main-workspace master used to discover this
+  manufacturing root
 - `Onshape Source` — URL; immutable released assembly link
 - `Last Synced At` — date with time
 - `Notes` — long text
@@ -144,18 +140,9 @@ For Baserow Cloud, no repository variable is necessary. For self-hosting, add a
 repository Actions variable named `BASEROW_API_URL`, for example
 `https://baserow.example.org/api`.
 
-Create these repository Actions secrets:
-
-- `ONSHAPE_DOC_URL_DELTA` and `ONSHAPE_DOC_URL_EPSILON` — master assembly Main
-  URLs, retained as the integration baselines.
-- `ONSHAPE_MANUFACTURING_ROOT_URLS_DELTA` and
-  `ONSHAPE_MANUFACTURING_ROOT_URLS_EPSILON` — JSON arrays of independently
-  released manufacturing-root Main URLs.
-
-Do not configure overlapping manufacturing roots unless duplicated production
-requirements are intentional. For example, do not track both a complete arm
-assembly and one of its nested assemblies as production roots if both expanded
-BOMs contain the same fabricated parts.
+Create `ONSHAPE_DOC_URL_DELTA` and `ONSHAPE_DOC_URL_EPSILON` repository Actions
+secrets containing the applicable master assembly Main-workspace URLs. No
+manufacturing-root URL-list secrets are required.
 
 ## Validation and cutover
 
@@ -177,14 +164,11 @@ gh workflow run onshape_baserow_delta.yml --ref <implementation-branch> -f dry_r
 gh workflow run onshape_baserow_poot_horse.yml --ref <implementation-branch> -f dry_run=true
 ```
 
-The optional manual `onshape_doc_url` input replaces the manufacturing-root
-list with one assembly for either a dry run or a production run dispatched from
-the default branch. The configured master remains the comparison baseline.
-Scheduled and repository-dispatch runs always use the manufacturing-root list
-secret. This makes it possible to treat any assembly tab as the tracked root for
-a diagnostic run.
-For example, to validate release resolution using A-26C-0004 while leaving the
-poot_horse production URL intact:
+The optional manual `onshape_doc_url` input replaces the master Main-workspace
+URL for either a dry run or a production run dispatched from the default
+branch. Scheduled and repository-dispatch runs always use the corresponding
+`ONSHAPE_DOC_URL_*` secret. For example, to validate discovery from another
+master workspace while leaving the poot_horse production secret intact:
 
 ```text
 gh workflow run onshape_baserow_poot_horse.yml \
@@ -196,10 +180,12 @@ gh workflow run onshape_baserow_poot_horse.yml \
 The workflow files already exist on the default branch, which permits
 `workflow_dispatch` to select the implementation branch's version. Selecting
 `dry_run=false` on a non-default branch runs neither job, so it cannot start a
-production Baserow sync. A production override on the default branch writes the
-selected manufacturing root's latest released BOM and deactivates only older
-requirements belonging to that same root, so validate the same URL in a dry run
-first.
+production Baserow sync. A production override on the default branch discovers
+the selected master's direct children, writes their latest released BOMs, and
+deactivates older requirements only for children successfully synchronized in
+that run. A child removed from the unreleased master is marked
+`Missing from Main — Review`; its requirements are not automatically
+deactivated. Validate the same master URL in a dry run first.
 
 After validation, dispatch the production override from the default branch:
 
@@ -219,9 +205,9 @@ python pre-2027-onshape_ci/OnshapeToBaserow.py --dry-run --output-json bom-dry-r
 
 1. Keep the existing Google Sheets workflow enabled.
 2. Run `Sync Onshape Delta BOM to Baserow` manually with `dry_run` enabled.
-3. Verify every source revision/version, root-scoped production key, master
-   baseline comparison, source count, aggregated quantity, configuration, part
-   revision, and warning.
+3. Verify the discovered direct children, every source revision/version,
+   root-scoped production key, source count, aggregated quantity, configuration,
+   part revision, and warning.
 4. Resolve any missing single-select choices or field-name mismatches.
 5. Run the workflow without `dry_run`, then let both workflows run in parallel
    before removing Data Fetcher and Sheets.
