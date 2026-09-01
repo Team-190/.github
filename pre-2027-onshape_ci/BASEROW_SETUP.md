@@ -180,10 +180,9 @@ The sync reads these values from each part's immutable released-version metadata
 so the custom properties do not need to be visible columns in the assembly BOM.
 Property names and values are matched case-insensitively. `None` creates no
 operation. The corresponding `Machine OP1` through `Machine OP4` fields on the
-Production Requirements table receive the original Onshape values without
-machine aliases or capitalization changes. For Operations rows, every configured
-Baserow machine choice is normalized to its exact capitalization. These
-additional aliases are also supported:
+Production Requirements table and the `Machine` field on Operations rows
+normalize every configured Baserow machine choice to its exact capitalization.
+These additional aliases are also supported:
 
 - `Haas CNC` or `Haas` becomes `Haas CNC`
 - `ShopSabre`, `Shop Sabre`, or `Shop Sabre CNC` becomes `Shop Sabre CNC`

@@ -1186,13 +1186,11 @@ def operation_machines_from_row(row: dict) -> tuple[tuple[str, str], ...]:
 
 
 def production_requirement_machine_fields(row: dict) -> dict:
-    """Return the released Onshape routing values without machine aliases."""
+    """Return released routing values using exact Baserow choice names."""
     fields = {}
     for index, property_name in enumerate(OPERATION_PROPERTY_NAMES, start=1):
-        machine = str(row_property(row, property_name) or "").strip()
-        if normalized_property_name(machine) in ("", "none", "selectvalue"):
-            machine = None
-        fields[f"Machine OP{index}"] = machine
+        machine = operation_machine_name(row_property(row, property_name))
+        fields[f"Machine OP{index}"] = machine or None
     return fields
 
 

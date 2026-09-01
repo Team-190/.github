@@ -1057,6 +1057,26 @@ class RecordBuildingTests(unittest.TestCase):
                     MODULE.operation_machine_name(machine.swapcase()), machine
                 )
 
+    def test_requirement_machine_fields_use_exact_baserow_choice_casing(self):
+        fields = MODULE.production_requirement_machine_fields(
+            {
+                "Manufacturing Method": "countersinking",
+                "Manufacturing Method OP2": "Threaded insert",
+                "Manufacturing Method OP3": "threaded insert",
+                "Manufacturing Method OP4": "NONE",
+            }
+        )
+
+        self.assertEqual(
+            fields,
+            {
+                "Machine OP1": "Countersinking",
+                "Machine OP2": "Threaded Insert",
+                "Machine OP3": "Threaded Insert",
+                "Machine OP4": None,
+            },
+        )
+
     def test_part_operation_metadata_uses_immutable_configured_source_and_cache(self):
         item_source = {
             "documentId": "1" * 24,
@@ -1145,9 +1165,9 @@ class RecordBuildingTests(unittest.TestCase):
                 for index in range(1, 5)
             },
             {
-                "Machine OP1": "hAaS CnC",
-                "Machine OP2": "bAMbu 3D pRinter",
-                "Machine OP3": "sHoPsAbRe",
+                "Machine OP1": "Haas CNC",
+                "Machine OP2": "Bambu 3D Printer",
+                "Machine OP3": "Shop Sabre CNC",
                 "Machine OP4": None,
             },
         )
@@ -1758,7 +1778,7 @@ class MultiRootSyncTests(unittest.TestCase):
             "BOM Positions": "1",
             "Onshape Source": "https://example/one",
             "Machine OP1": "Haas CNC",
-            "Machine OP2": "tapping",
+            "Machine OP2": "Tapping",
             "Machine OP3": None,
             "Machine OP4": None,
             "Active in BOM": True,
@@ -1851,7 +1871,7 @@ class MultiRootSyncTests(unittest.TestCase):
         self.assertTrue(root_row["Active"])
         self.assertEqual(created_requirement["Assembly"], [root_row["id"]])
         self.assertEqual(created_requirement["Machine OP1"], "Haas CNC")
-        self.assertEqual(created_requirement["Machine OP2"], "tapping")
+        self.assertEqual(created_requirement["Machine OP2"], "Tapping")
         self.assertIsNone(created_requirement["Machine OP3"])
         self.assertIsNone(created_requirement["Machine OP4"])
 
