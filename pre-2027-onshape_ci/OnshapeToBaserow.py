@@ -2,8 +2,9 @@
 """Synchronize an Onshape multilevel BOM into Baserow.
 
 Engineering-owned fields are updated when a manufacturing-root revision changes.
-Manufacturing status, machine, machinist, finishing, location, QC, and disposition
-are intentionally untouched.
+Manufacturing status, machinist, location, QC, and disposition are intentionally
+untouched. Released routing, powder-coat color, and their work queues are
+sync-managed.
 """
 
 from __future__ import annotations
@@ -53,6 +54,12 @@ OPERATION_PROPERTY_NAMES = (
     "Manufacturing Method OP3",
     "Manufacturing Method OP4",
 )
+POWDER_COAT_PROPERTY_NAME = "Powder Coat Color"
+HYDRATED_PART_PROPERTY_NAMES = (
+    *OPERATION_PROPERTY_NAMES,
+    POWDER_COAT_PROPERTY_NAME,
+)
+SYNC_SCHEMA_VERSION = "finishing-v1"
 BASEROW_MACHINE_NAMES = (
     "Haas CNC",
     "Shop Sabre CNC",
@@ -1099,6 +1106,17 @@ def operation_machine_name(value) -> str:
     return MACHINE_NAME_ALIASES.get(normalized, machine)
 
 
+def powder_coat_color(value) -> str:
+    """Return an exact Baserow choice for the released Onshape color."""
+    normalized = normalized_property_name(value)
+    if normalized in ("", "none", "selectvalue"):
+        return "None"
+    choices = {"red": "Red", "black": "Black"}
+    if normalized not in choices:
+        raise ValueError(f"Unsupported Powder Coat Color value: {value!r}")
+    return choices[normalized]
+
+
 def fetch_part_metadata(item_source: dict, default_base_url: str) -> dict | None:
     """Read immutable metadata for one released BOM part/configuration."""
     reference = source_document_reference(item_source, default_base_url)
@@ -1169,7 +1187,7 @@ def hydrate_operation_properties(
                 metadata = cache[cache_key]
                 if metadata is not None:
                     metadata_values = operation_metadata_values(metadata)
-                    for property_name in OPERATION_PROPERTY_NAMES:
+                    for property_name in HYDRATED_PART_PROPERTY_NAMES:
                         property_key = normalized_property_name(property_name)
                         if property_key in metadata_values:
                             row[property_name] = metadata_values[property_key]
@@ -1330,6 +1348,9 @@ def build_records(
                 "Required Quantity": Decimal("0"),
                 "positions": [],
                 "Onshape Source": source_url,
+                "Finishing": powder_coat_color(
+                    row_property(row, POWDER_COAT_PROPERTY_NAME)
+                ),
                 "Active in BOM": True,
                 **requirement_machine_fields,
                 "_operation_machines": operation_machines,
@@ -1498,6 +1519,8 @@ def all_root_revisions_are_current(
             or current is None
             or str(current.get("Latest Released Revision") or "").strip()
             != revision
+            or str(current.get("Sync Schema Version") or "").strip()
+            != SYNC_SCHEMA_VERSION
         ):
             return False
 
@@ -1761,6 +1784,7 @@ def sync_to_baserow(
         "requirements": int(require_env("BASEROW_REQUIREMENTS_TABLE_ID")),
         "operations": int(require_env("BASEROW_OPERATIONS_TABLE_ID")),
         "assemblies": int(require_env("BASEROW_ASSEMBLIES_TABLE_ID")),
+        "finishing": int(require_env("BASEROW_FINISHING_TABLE_ID")),
     }
     started = utc_now()
     run = client.create_one(table_ids["sync"], {"Started At": started, "Result": "Running", "Source Rows": source_rows})
@@ -1804,6 +1828,7 @@ def sync_to_baserow(
                 "Discovery Master",
                 "Onshape Source",
                 "Last Synced At",
+                "Sync Schema Version",
             )
             root_assembly_fields = tuple(
                 field
@@ -1936,6 +1961,7 @@ def sync_to_baserow(
             "Machine OP2",
             "Machine OP3",
             "Machine OP4",
+            "Finishing",
             "Active in BOM",
             )
             if not available_requirement_fields
@@ -2003,6 +2029,71 @@ def sync_to_baserow(
             str(row.get("Production Key") or ""): row
             for row in client.list_rows(table_ids["requirements"])
         }
+        synced_requirement_ids = {
+            int(row["id"])
+            for row in requirement_rows_by_key.values()
+            if str(row.get("Source Root") or "").strip() in synced_roots
+        }
+
+        desired_finishing = []
+        for requirement in requirements:
+            color = str(requirement.get("Finishing") or "None")
+            if color not in ("Red", "Black"):
+                continue
+            production_key = str(requirement.get("Production Key") or "")
+            requirement_row = requirement_rows_by_key.get(production_key)
+            if requirement_row is None:
+                raise RuntimeError(
+                    "No Baserow Production Requirement row found for finishing "
+                    f"queue item {production_key or '(unnamed)'}"
+                )
+            desired_finishing.append(
+                {
+                    "Production Key": production_key,
+                    "Production Requirement": [requirement_row["id"]],
+                    "Powder Coat Color": color,
+                    "Required Quantity": requirement["Required Quantity"],
+                    "Active": True,
+                    "Last Synced At": now,
+                }
+            )
+        # Machinist is assigned by manufacturing and must survive every resync.
+        # Finishing also has no claimed/completed quantity fields: each action
+        # represents the full Required Quantity for the Production Requirement.
+        finishing_fields = (
+            "Production Requirement",
+            "Powder Coat Color",
+            "Required Quantity",
+            "Active",
+            "Last Synced At",
+        )
+        (
+            finishing_created,
+            finishing_updated,
+            finishing_unchanged,
+        ) = upsert_table(
+            client,
+            table_ids["finishing"],
+            "Production Key",
+            desired_finishing,
+            finishing_fields,
+        )
+        desired_finishing_keys = {
+            row["Production Key"] for row in desired_finishing
+        }
+        deactivate_finishing = [
+            {"id": row["id"], "Active": False, "Last Synced At": now}
+            for row in client.list_rows(table_ids["finishing"])
+            if str(row.get("Production Key") or "") not in desired_finishing_keys
+            and row.get("Active") is not False
+            and bool(
+                linked_row_ids(row.get("Production Requirement"))
+                & synced_requirement_ids
+            )
+        ]
+        if deactivate_finishing:
+            client.batch_update(table_ids["finishing"], deactivate_finishing)
+
         existing_operations = client.list_rows(table_ids["operations"])
         operation_statuses = operation_statuses_for_routes(
             operations, existing_operations
@@ -2047,11 +2138,6 @@ def sync_to_baserow(
         desired_operation_keys = {
             operation["Operation"] for operation in desired_operations
         }
-        synced_requirement_ids = {
-            int(row["id"])
-            for row in requirement_rows_by_key.values()
-            if str(row.get("Source Root") or "").strip() in synced_roots
-        }
         deactivate_operations = [
             {"id": row["id"], "Active in Routing": False}
             for row in client.list_rows(table_ids["operations"])
@@ -2089,6 +2175,10 @@ def sync_to_baserow(
             "operations_updated": operations_updated,
             "operations_unchanged": operations_unchanged,
             "operations_deactivated": len(deactivate_operations),
+            "finishing_created": finishing_created,
+            "finishing_updated": finishing_updated,
+            "finishing_unchanged": finishing_unchanged,
+            "finishing_deactivated": len(deactivate_finishing),
         }
         warnings = sorted(set(warnings))
         client.update_one(table_ids["sync"], run["id"], {
@@ -2388,6 +2478,7 @@ def run_sync(
                     released.bom_target(result["reference"].base_url)
                 ),
                 "Last Synced At": utc_now(),
+                "Sync Schema Version": SYNC_SCHEMA_VERSION,
             }
         )
 

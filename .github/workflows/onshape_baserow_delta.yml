@@ -62,6 +62,7 @@ jobs:
           BASEROW_PARTS_TABLE_ID: "1119641"
           BASEROW_REQUIREMENTS_TABLE_ID: "1119642"
           BASEROW_OPERATIONS_TABLE_ID: "1169282"
+          BASEROW_FINISHING_TABLE_ID: "1170619"
           BASEROW_STORAGE_LOCATIONS_TABLE_ID: "1119643"
           BASEROW_ASSEMBLIES_TABLE_ID: "1119645"
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

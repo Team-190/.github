@@ -76,6 +76,8 @@ Field names are API contracts and must match the names below exactly.
   manufacturing root
 - `Onshape Source` — URL; immutable released assembly link
 - `Last Synced At` — date with time
+- `Sync Schema Version` — text; internal migration marker used to force one
+  complete sync after managed schema changes
 - `Notes` — long text
 
 ### Parts
@@ -129,7 +131,8 @@ value before the first sync, including `SELECT VALUE:` during migration.
 - `Status` — single select; default `Needs Drawing`
 - `Machine` — single select
 - `Machinist` — text
-- `Finishing` — single select
+- `Finishing` — single select with exactly `None`, `Red`, and `Black`; synced
+  from the released Onshape `Powder Coat Color` property
 - `Current Location` — link to one Storage Locations row
 - `QC Outcome` — single select; default `Not Inspected`
 - `Disposition` — single select; default `Make`
@@ -147,6 +150,26 @@ Status choices:
 6. Needs Rework
 7. Ready for Finishing
 8. Complete
+
+### Finishing
+
+This is the active powder-coating work queue. The default grid view filters
+`Active` to selected so it shows every current Production Requirement whose
+released `Powder Coat Color` is `Red` or `Black`.
+
+- `Production Key` — primary text
+- `Production Requirement` — link to one Production Requirements row
+- `Active` — boolean
+- `Powder Coat Color` — single select with exactly `Red` and `Black`
+- `Required Quantity` — number
+- `Last Synced At` — date with time
+- `Machinist` — text; assigned manually and preserved by the sync
+
+Production Requirements with `Powder Coat Color = None` are excluded. Queue
+rows are retained but marked inactive when a later release no longer needs
+powder coating. `Required Quantity` is informational: finishing does not track
+claimed or partially completed quantities. Completing a finishing row means the
+Machinist finished the entire Production Requirement quantity.
 
 ### Operations
 

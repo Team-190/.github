@@ -1101,6 +1101,7 @@ class RecordBuildingTests(unittest.TestCase):
             "properties": [
                 {"name": "manufacturing method", "value": "HAAS CNC"},
                 {"name": "Manufacturing Method OP2", "value": "ShopSabre"},
+                {"name": "Powder Coat Color", "value": "Red"},
             ]
         }
 
@@ -1116,6 +1117,7 @@ class RecordBuildingTests(unittest.TestCase):
             MODULE.operation_machines_from_row(hydrated[0]),
             (("OP1", "Haas CNC"), ("OP2", "Shop Sabre CNC")),
         )
+        self.assertEqual(hydrated[0]["Powder Coat Color"], "Red")
 
     def test_part_metadata_request_includes_configuration(self):
         item_source = {
@@ -1147,6 +1149,7 @@ class RecordBuildingTests(unittest.TestCase):
                 "manufacturing_method_op2": "bAMbu 3D pRinter",
                 "Manufacturing Method OP3": "sHoPsAbRe",
                 "Manufacturing Method OP4": "nOnE",
+                "powder_coat_color": "bLaCk",
                 "itemSource": source("https://example/direct", 0),
             }
         ]
@@ -1160,6 +1163,7 @@ class RecordBuildingTests(unittest.TestCase):
         operations = MODULE.build_operation_records(requirements)
 
         self.assertEqual(warnings, [])
+        self.assertEqual(requirements[0]["Finishing"], "Black")
         self.assertEqual(
             {
                 f"Machine OP{index}": requirements[0][f"Machine OP{index}"]
@@ -1362,6 +1366,59 @@ class RecordBuildingTests(unittest.TestCase):
 
 
 class BaserowClientTests(unittest.TestCase):
+    def test_finishing_upsert_preserves_manually_assigned_machinist(self):
+        class Client:
+            def __init__(self):
+                self.updated = []
+
+            def list_rows(self, table_id):
+                return [
+                    {
+                        "id": 7,
+                        "Production Key": "REQ-1",
+                        "Production Requirement": [3],
+                        "Powder Coat Color": "Red",
+                        "Required Quantity": 1,
+                        "Active": True,
+                        "Last Synced At": "old",
+                        "Machinist": "Corey",
+                    }
+                ]
+
+            def batch_create(self, table_id, rows):
+                self.fail("The existing finishing row should be updated")
+
+            def batch_update(self, table_id, rows):
+                self.updated.extend(rows)
+                return rows
+
+        client = Client()
+        desired = [
+            {
+                "Production Key": "REQ-1",
+                "Production Requirement": [3],
+                "Powder Coat Color": "Black",
+                "Required Quantity": 4,
+                "Active": True,
+                "Last Synced At": "new",
+            }
+        ]
+        managed_fields = (
+            "Production Requirement",
+            "Powder Coat Color",
+            "Required Quantity",
+            "Active",
+            "Last Synced At",
+        )
+
+        created, updated, unchanged = MODULE.upsert_table(
+            client, 6, "Production Key", desired, managed_fields
+        )
+
+        self.assertEqual((created, updated, unchanged), (0, 1, 0))
+        self.assertEqual(len(client.updated), 1)
+        self.assertNotIn("Machinist", client.updated[0])
+
     def test_root_revision_gate_matches_baserow_and_checks_discovery_membership(self):
         released = MODULE.released_assembly_from_revision(
             revision("B", VID_B, partNumber="A-ROOT-ONE")
@@ -1375,6 +1432,7 @@ class BaserowClientTests(unittest.TestCase):
                     {
                         "Assembly Number": "A-ROOT-ONE",
                         "Latest Released Revision": "B",
+                        "Sync Schema Version": MODULE.SYNC_SCHEMA_VERSION,
                         "Discovery Master": discovery_master,
                         "Integration Status": "Discovered — Master Unreleased",
                     }
@@ -1753,6 +1811,7 @@ class MultiRootSyncTests(unittest.TestCase):
             "requirements": 3,
             "assemblies": 4,
             "operations": 5,
+            "finishing": 6,
         }
         desired_part = {
             "Part Number": "P-190B-260101",
@@ -1791,6 +1850,7 @@ class MultiRootSyncTests(unittest.TestCase):
                             "Machine OP2": None,
                             "Machine OP3": None,
                             "Machine OP4": None,
+                            "Finishing": None,
                             "Active in BOM": True,
                         },
                         {
@@ -1831,6 +1891,20 @@ class MultiRootSyncTests(unittest.TestCase):
                             "Machine": "Haas CNC",
                             "Status": "In Progress",
                             "Active in Routing": True,
+                        },
+                    ],
+                    table_ids["finishing"]: [
+                        {
+                            "id": 60,
+                            "Production Key": "stale-finishing",
+                            "Production Requirement": [{"id": 30}],
+                            "Active": True,
+                        },
+                        {
+                            "id": 61,
+                            "Production Key": "other-root-finishing",
+                            "Production Requirement": [{"id": 31}],
+                            "Active": True,
                         },
                     ],
                 }
@@ -1877,6 +1951,7 @@ class MultiRootSyncTests(unittest.TestCase):
             "Machine OP2": "Tapping",
             "Machine OP3": None,
             "Machine OP4": None,
+            "Finishing": "Red",
             "Active in BOM": True,
         }
         env = {
@@ -1887,6 +1962,7 @@ class MultiRootSyncTests(unittest.TestCase):
             "BASEROW_REQUIREMENTS_TABLE_ID": "3",
             "BASEROW_ASSEMBLIES_TABLE_ID": "4",
             "BASEROW_OPERATIONS_TABLE_ID": "5",
+            "BASEROW_FINISHING_TABLE_ID": "6",
         }
         operation_key = requirement["Production Key"] + "|OP1"
 
@@ -1970,6 +2046,31 @@ class MultiRootSyncTests(unittest.TestCase):
         self.assertEqual(created_requirement["Machine OP2"], "Tapping")
         self.assertIsNone(created_requirement["Machine OP3"])
         self.assertIsNone(created_requirement["Machine OP4"])
+        self.assertEqual(created_requirement["Finishing"], "Red")
+        finishing_row = next(
+            row
+            for row in client.rows[table_ids["finishing"]]
+            if row["Production Key"] == requirement["Production Key"]
+        )
+        self.assertEqual(
+            finishing_row["Production Requirement"], [created_requirement["id"]]
+        )
+        self.assertEqual(finishing_row["Powder Coat Color"], "Red")
+        self.assertEqual(finishing_row["Required Quantity"], 1)
+        self.assertTrue(finishing_row["Active"])
+        finishing_updates = [
+            row
+            for table_id, rows in client.updates
+            if table_id == table_ids["finishing"]
+            for row in rows
+        ]
+        self.assertTrue(
+            any(
+                row.get("id") == 60 and row.get("Active") is False
+                for row in finishing_updates
+            )
+        )
+        self.assertFalse(any(row.get("id") == 61 for row in finishing_updates))
 
 
 if __name__ == "__main__":
