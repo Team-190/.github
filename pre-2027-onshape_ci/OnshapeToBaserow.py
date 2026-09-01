@@ -183,6 +183,26 @@ def parse_onshape_doc_url(doc_url: str) -> OnshapeTarget:
     )
 
 
+def parse_onshape_doc_urls(doc_urls: str) -> list[OnshapeTarget]:
+    """Parse a comma- or newline-separated list of Onshape assembly URLs."""
+    values = [
+        value.strip()
+        for value in re.split(r"[\r\n,]+", str(doc_urls or ""))
+        if value.strip()
+    ]
+    if not values:
+        raise ValueError("ONSHAPE_SUBASSEMBLY_URLS must contain at least one URL")
+    targets = []
+    for value in values:
+        try:
+            targets.append(parse_onshape_doc_url(value))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid URL in ONSHAPE_SUBASSEMBLY_URLS: {value}"
+            ) from exc
+    return targets
+
+
 def onshape_target_url(target: OnshapeTarget) -> str:
     base = (
         f"{target.base_url.rstrip('/')}/documents/{target.did}/"
@@ -2246,19 +2266,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    master_target = parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))
+    use_subassembly_list = environment_flag("USE_SUBASSEMBLY_LIST")
+    if use_subassembly_list:
+        sync_targets = parse_onshape_doc_urls(
+            require_env("ONSHAPE_SUBASSEMBLY_URLS")
+        )
+    else:
+        sync_targets = parse_onshape_doc_url(require_env("ONSHAPE_DOC_URL"))
     prefixes = [
         p.strip()
         for p in os.environ.get("PARTNUMBER_PREFIXES", "").split(",")
         if p.strip()
     ]
     run_sync(
-        master_target,
+        sync_targets,
         prefixes,
         dry_run=args.dry_run,
         output_json=args.output_json,
         sync_cad_files=environment_flag("SYNC_CAD_FILES"),
-        discover_from_master=True,
+        discover_from_master=not use_subassembly_list,
     )
     return 0
 

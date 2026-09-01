@@ -7,6 +7,14 @@ On the Operations table it updates only the released Onshape routing fields;
 operation status, machinist, instructions, timestamps, and notes remain
 manufacturing-owned.
 
+The poot-horse workflow defaults to `USE_SUBASSEMBLY_LIST=true` and reads the
+manufacturing-root URLs stored in `DEFAULT_ONSHAPE_SUBASSEMBLY_URLS` in the
+workflow file. Each URL is resolved to its latest released assembly revision,
+and every resolved root gets an Assemblies row even when it has no matching
+production parts. A manual `subassembly_urls` input can replace the configured
+list with one or more comma- or newline-separated URLs.
+
+When `USE_SUBASSEMBLY_LIST=false`, and in the Delta workflow,
 `ONSHAPE_DOC_URL` points to the master assembly tab in Main. The master does not
 need to be released. Its workspace BOM is used only to discover direct `A-...`
 child assemblies; nested assemblies are intentionally ignored so their parts
@@ -197,9 +205,11 @@ For Baserow Cloud, no `BASEROW_API_URL` repository variable is necessary. For
 self-hosting, add a repository Actions variable named `BASEROW_API_URL`, for example
 `https://baserow.example.org/api`.
 
-Create `ONSHAPE_DOC_URL_DELTA` and `ONSHAPE_DOC_URL_EPSILON` repository Actions
-secrets containing the applicable master assembly Main-workspace URLs. No
-manufacturing-root URL-list secrets are required.
+Create `ONSHAPE_DOC_URL_DELTA` as a repository Actions secret containing the
+Delta master assembly Main-workspace URL. `ONSHAPE_DOC_URL_EPSILON` is used only
+when the poot-horse workflow opts out of its configured subassembly list and
+returns to Main-workspace discovery. No manufacturing-root URL-list secret is
+required because that list is stored in the poot-horse workflow.
 
 ## Validation and cutover
 
@@ -222,28 +232,32 @@ gh workflow run onshape_baserow_delta.yml --ref <implementation-branch> -f dry_r
 gh workflow run onshape_baserow_poot_horse.yml --ref <implementation-branch> -f dry_run=true
 ```
 
-The optional manual `onshape_doc_url` input replaces the master Main-workspace
-URL for either a dry run or a production run dispatched from the default
-branch. Scheduled and repository-dispatch runs always use the corresponding
-`ONSHAPE_DOC_URL_*` secret. For example, to validate discovery from another
-master workspace while leaving the poot_horse production secret intact:
+The poot-horse workflow uses its configured subassembly list by default. To
+test Operations for only one manufacturing root, keep list mode enabled and
+provide `subassembly_urls`:
 
 ```text
 gh workflow run onshape_baserow_poot_horse.yml \
   --ref <implementation-branch> \
   -f dry_run=true \
-  -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
+  -f use_subassembly_list=true \
+  -f sync_cad_files=false \
+  -f subassembly_urls="https://frc190.onshape.com/documents/.../w/.../e/..."
 ```
+
+Set `use_subassembly_list=false` to use Main-workspace discovery instead. In
+that mode, the optional `onshape_doc_url` input replaces
+`ONSHAPE_DOC_URL_EPSILON` for the manual run.
 
 The workflow files already exist on the default branch, which permits
 `workflow_dispatch` to select the implementation branch's version. Selecting
 `dry_run=false` on a non-default branch runs neither job, so it cannot start a
-production Baserow sync. A production override on the default branch discovers
-the selected master's direct children, writes their latest released BOMs, and
-deactivates older requirements only for children successfully synchronized in
-that run. A child removed from the unreleased master is marked
-`Missing from Main — Review`; its requirements are not automatically
-deactivated. Validate the same master URL in a dry run first.
+production Baserow sync. In list mode, the run writes the latest released BOM
+for every configured root and deactivates older requirements only within those
+successfully synced roots. In Main-discovery mode, a child removed from the
+unreleased master is marked `Missing from Main — Review`; its requirements are
+not automatically deactivated. Validate the same target selection in a dry run
+first.
 
 After validation, dispatch the production override from the default branch:
 
@@ -251,7 +265,7 @@ After validation, dispatch the production override from the default branch:
 gh workflow run onshape_baserow_poot_horse.yml \
   --ref main \
   -f dry_run=false \
-  -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
+  -f use_subassembly_list=true
 ```
 
 For local use:

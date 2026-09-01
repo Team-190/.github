@@ -180,6 +180,59 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(parsed.wvm_type, "w")
         self.assertEqual(parsed.configuration, "size=Large+length=1+meter")
 
+    def test_document_url_list_accepts_newlines_and_commas(self):
+        first = f"https://cad.onshape.com/documents/{DID}/w/{WID}/e/{EID}"
+        second = (
+            f"https://cad.onshape.com/documents/{'1' * 24}/w/"
+            f"{'2' * 24}/e/{'3' * 24}"
+        )
+
+        parsed = MODULE.parse_onshape_doc_urls(f"{first}\n{second},{first}")
+
+        self.assertEqual(len(parsed), 3)
+        self.assertEqual([target.did for target in parsed], [DID, "1" * 24, DID])
+
+    def test_main_uses_subassembly_list_without_master_discovery(self):
+        first = f"https://cad.onshape.com/documents/{DID}/w/{WID}/e/{EID}"
+        second = (
+            f"https://cad.onshape.com/documents/{'1' * 24}/w/"
+            f"{'2' * 24}/e/{'3' * 24}"
+        )
+        environment = {
+            "USE_SUBASSEMBLY_LIST": "true",
+            "ONSHAPE_SUBASSEMBLY_URLS": f"{first}\n{second}",
+            "PARTNUMBER_PREFIXES": "P-190B-26",
+            "SYNC_CAD_FILES": "false",
+        }
+
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            MODULE, "run_sync"
+        ) as run_sync:
+            result = MODULE.main([])
+
+        self.assertEqual(result, 0)
+        targets = run_sync.call_args.args[0]
+        self.assertEqual([target.did for target in targets], [DID, "1" * 24])
+        self.assertFalse(run_sync.call_args.kwargs["discover_from_master"])
+
+    def test_main_can_opt_out_to_master_discovery(self):
+        master = f"https://cad.onshape.com/documents/{DID}/w/{WID}/e/{EID}"
+        environment = {
+            "USE_SUBASSEMBLY_LIST": "false",
+            "ONSHAPE_DOC_URL": master,
+            "PARTNUMBER_PREFIXES": "P-190B-26",
+            "SYNC_CAD_FILES": "false",
+        }
+
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            MODULE, "run_sync"
+        ) as run_sync:
+            result = MODULE.main([])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run_sync.call_args.args[0].did, DID)
+        self.assertTrue(run_sync.call_args.kwargs["discover_from_master"])
+
     def test_release_resolution_uses_part_number_and_returned_coordinates(self):
         metadata = {
             "properties": [
@@ -437,6 +490,13 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(saved["requirements"][0]["Configuration"], "width=0.5+meter")
         self.assertEqual(saved["requirements"][0]["Required Quantity"], 2)
         self.assertEqual(saved["requirements"][0]["BOM Positions"], "1.2")
+        self.assertEqual(len(saved["assemblies"]), 1)
+        self.assertEqual(
+            saved["assemblies"][0]["Assembly Number"], "A-190B-260001"
+        )
+        self.assertEqual(
+            saved["assemblies"][0]["Integration Status"], "Not Compared"
+        )
         self.assertEqual(len(saved["operations"]), 1)
         self.assertEqual(saved["operations"][0]["Operation Number"], "OP1")
         self.assertEqual(saved["operations"][0]["Machine"], "Haas CNC")

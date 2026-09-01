@@ -9,7 +9,16 @@ on:
         default: false
         type: boolean
       onshape_doc_url:
-        description: Optional master Main-workspace assembly URL for manual runs
+        description: Optional master Main URL when use_subassembly_list is false
+        required: false
+        type: string
+      use_subassembly_list:
+        description: Sync the configured manufacturing-root URL list instead of discovering from Main
+        required: false
+        default: true
+        type: boolean
+      subassembly_urls:
+        description: Optional comma- or newline-separated manufacturing-root URLs for a manual list-mode run
         required: false
         type: string
       sync_cad_files:
@@ -27,6 +36,17 @@ concurrency:
     onshape-baserow-poot_horse-${{ github.event_name == 'workflow_dispatch' &&
       inputs.dry_run && 'dry-run' || 'production' }}
   cancel-in-progress: true
+
+env:
+  DEFAULT_ONSHAPE_SUBASSEMBLY_URLS: |-
+    https://frc190.onshape.com/documents/0b93a945f55626752d97aece/w/2702276d5f65f473e96092c1/e/bae881f75f307113a9bb5d23
+    https://frc190.onshape.com/documents/e6a03477fcf74dae02a191b5/w/af849f9a5aae8b198e57dc0d/e/e8cdd43e3043c566dad73817
+    https://frc190.onshape.com/documents/a954232c9b6c463860aa96c4/w/3b807be2adbfbd1312b0fbad/e/bf82f03d4a60b091329121ab
+    https://frc190.onshape.com/documents/0a0e6617e29d1bda5890611e/w/3e818f12858b4865855c342a/e/480a0ad728f08b540f6fe926
+    https://frc190.onshape.com/documents/f49c226c2be777de53eff8eb/w/d16ff967a07bf58bc0cd31d4/e/0ce7ac2d1129b2fb10ce1648
+    https://frc190.onshape.com/documents/61a258c0f66147f28e3c7f0a/w/01c1a403cf0a5f43a05ba283/e/3e3880ecde30502433dd9a7c
+    https://frc190.onshape.com/documents/542957ea4bc25b28b1742c89/w/310f8133eb7ee3938606a3ab/e/7e076be1de235b8e69a6a4ef
+    https://frc190.onshape.com/documents/e0e5730aacdbb8063c5716e8/w/bbf4b4765261ae88cc30b198/e/81e8a72bfca21fa77a8e2aea
 
 jobs:
   sync:
@@ -63,6 +83,11 @@ jobs:
             ${{ github.event_name == 'workflow_dispatch' &&
                 inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_EPSILON }}
           PARTNUMBER_PREFIXES: "P-190B-26"
+          USE_SUBASSEMBLY_LIST: >-
+            ${{ github.event_name != 'workflow_dispatch' || inputs.use_subassembly_list }}
+          ONSHAPE_SUBASSEMBLY_URLS: >-
+            ${{ github.event_name == 'workflow_dispatch' && inputs.subassembly_urls ||
+                env.DEFAULT_ONSHAPE_SUBASSEMBLY_URLS }}
           SYNC_CAD_FILES: >-
             ${{ github.event_name != 'workflow_dispatch' || inputs.sync_cad_files }}
 
@@ -108,6 +133,9 @@ jobs:
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
           ONSHAPE_DOC_URL: ${{ inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_EPSILON }}
           PARTNUMBER_PREFIXES: "P-190B-26"
+          USE_SUBASSEMBLY_LIST: ${{ inputs.use_subassembly_list }}
+          ONSHAPE_SUBASSEMBLY_URLS: >-
+            ${{ inputs.subassembly_urls || env.DEFAULT_ONSHAPE_SUBASSEMBLY_URLS }}
           SYNC_CAD_FILES: ${{ inputs.sync_cad_files }}
         run: >-
           python pre-2027-onshape_ci/OnshapeToBaserow.py
