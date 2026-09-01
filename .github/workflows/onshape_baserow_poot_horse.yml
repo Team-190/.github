@@ -12,6 +12,11 @@ on:
         description: Optional master Main-workspace assembly URL for manual runs
         required: false
         type: string
+      sync_cad_files:
+        description: Export and upload drawing PDFs and part STEP files
+        required: false
+        default: true
+        type: boolean
   repository_dispatch:
     types: [bom_sync_poot_horse_baserow]
   schedule:
@@ -58,7 +63,8 @@ jobs:
             ${{ github.event_name == 'workflow_dispatch' &&
                 inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_EPSILON }}
           PARTNUMBER_PREFIXES: "P-190B-26"
-          SYNC_CAD_FILES: "true"
+          SYNC_CAD_FILES: >-
+            ${{ github.event_name != 'workflow_dispatch' || inputs.sync_cad_files }}
 
           BASEROW_API_URL: ${{ vars.BASEROW_API_URL || 'https://api.baserow.io/api' }}
           BASEROW_TOKEN: ${{ secrets.BASEROW_TOKEN }}
@@ -102,7 +108,7 @@ jobs:
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
           ONSHAPE_DOC_URL: ${{ inputs.onshape_doc_url || secrets.ONSHAPE_DOC_URL_EPSILON }}
           PARTNUMBER_PREFIXES: "P-190B-26"
-          SYNC_CAD_FILES: "true"
+          SYNC_CAD_FILES: ${{ inputs.sync_cad_files }}
         run: >-
           python pre-2027-onshape_ci/OnshapeToBaserow.py
           --dry-run
