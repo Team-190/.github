@@ -1385,19 +1385,78 @@ class BaserowClient:
         response.raise_for_status()
         return response.json()
 
+    @staticmethod
+    def _raise_batch_error_with_context(
+        response, table_id: int, operation: str, items: list[dict]
+    ) -> None:
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            try:
+                response_detail = response.json()
+            except Exception:
+                response_detail = str(getattr(response, "text", "") or "").strip()
+            identifying_fields = (
+                "id",
+                "Production Key",
+                "Part Number",
+                "Assembly Number",
+                "Operation",
+                "Operation Number",
+                "Machine",
+                "Machine OP1",
+                "Machine OP2",
+                "Machine OP3",
+                "Machine OP4",
+            )
+            item_identifiers = []
+            for batch_index, item in enumerate(items):
+                identifier = {"batch_index": batch_index}
+                for field in identifying_fields:
+                    value = item.get(field)
+                    if value not in (None, "", [], {}):
+                        identifier[field] = value
+                item_identifiers.append(identifier)
+            detail_text = json.dumps(
+                response_detail, sort_keys=True, default=str
+            )[:10000]
+            identifiers_text = json.dumps(
+                item_identifiers, sort_keys=True, default=str
+            )[:20000]
+            raise RuntimeError(
+                f"Baserow batch {operation} failed for table {table_id} "
+                f"with HTTP {getattr(response, 'status_code', 'unknown')}; "
+                f"response={detail_text}; "
+                f"batch_item_identifiers={identifiers_text}"
+            ) from exc
+
     def batch_create(self, table_id: int, items: list[dict]) -> list[dict]:
         created = []
         for start in range(0, len(items), BATCH_SIZE):
-            response = self.session.post(self._url(table_id, "batch/"), json={"items": items[start:start+BATCH_SIZE]}, timeout=60)
-            response.raise_for_status()
+            batch = items[start:start+BATCH_SIZE]
+            response = self.session.post(
+                self._url(table_id, "batch/"),
+                json={"items": batch},
+                timeout=60,
+            )
+            self._raise_batch_error_with_context(
+                response, table_id, "create", batch
+            )
             created.extend(response.json().get("items", []))
         return created
 
     def batch_update(self, table_id: int, items: list[dict]) -> list[dict]:
         updated = []
         for start in range(0, len(items), BATCH_SIZE):
-            response = self.session.patch(self._url(table_id, "batch/"), json={"items": items[start:start+BATCH_SIZE]}, timeout=60)
-            response.raise_for_status()
+            batch = items[start:start+BATCH_SIZE]
+            response = self.session.patch(
+                self._url(table_id, "batch/"),
+                json={"items": batch},
+                timeout=60,
+            )
+            self._raise_batch_error_with_context(
+                response, table_id, "update", batch
+            )
             updated.extend(response.json().get("items", []))
         return updated
 

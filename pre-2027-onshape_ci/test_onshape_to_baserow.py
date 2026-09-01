@@ -33,6 +33,11 @@ class FakeResponse:
         return self.payload
 
 
+class RejectingResponse(FakeResponse):
+    def raise_for_status(self):
+        raise RuntimeError("400 Bad Request")
+
+
 DID = "a" * 24
 WID = "b" * 24
 EID = "c" * 24
@@ -1333,6 +1338,51 @@ class RecordBuildingTests(unittest.TestCase):
         ]
         _, requirements, _ = MODULE.build_records(rows, ["P-190B-26"])
         self.assertEqual(requirements[0]["BOM Positions"], "1.10")
+
+
+class BaserowClientTests(unittest.TestCase):
+    def test_batch_create_error_includes_response_and_machine_values(self):
+        response = RejectingResponse(
+            {
+                "error": "ERROR_REQUEST_BODY_VALIDATION",
+                "detail": {
+                    "items": {
+                        "1": {"Machine OP2": [{"error": "Invalid select option"}]}
+                    }
+                },
+            },
+            status_code=400,
+        )
+
+        class Session:
+            def post(self, url, json, timeout):
+                return response
+
+        client = object.__new__(MODULE.BaserowClient)
+        client.base_url = "https://api.baserow.test/api"
+        client.session = Session()
+        items = [
+            {
+                "Production Key": "A-ROOT|A|A-ROOT|P-ONE|default",
+                "Machine OP1": "Haas CNC",
+                "Machine OP2": None,
+            },
+            {
+                "Production Key": "A-ROOT|A|A-ROOT|P-TWO|default",
+                "Machine OP1": "Shop Sabre CNC",
+                "Machine OP2": "Haas CNC",
+            },
+        ]
+
+        with self.assertRaises(RuntimeError) as raised:
+            client.batch_create(1119642, items)
+
+        message = str(raised.exception)
+        self.assertIn("Baserow batch create failed for table 1119642", message)
+        self.assertIn("ERROR_REQUEST_BODY_VALIDATION", message)
+        self.assertIn('"batch_index": 1', message)
+        self.assertIn("A-ROOT|A|A-ROOT|P-TWO|default", message)
+        self.assertIn('"Machine OP2": "Haas CNC"', message)
 
 
 class MultiRootSyncTests(unittest.TestCase):
