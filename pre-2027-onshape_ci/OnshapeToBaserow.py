@@ -52,16 +52,36 @@ OPERATION_PROPERTY_NAMES = (
     "Manufacturing Method OP3",
     "Manufacturing Method OP4",
 )
+BASEROW_MACHINE_NAMES = (
+    "Haas CNC",
+    "Shop Sabre CNC",
+    "Milling Machine",
+    "Lathe",
+    "Markforged 3D Printer",
+    "Bambu 3D Printer",
+    "Bandsaw",
+    "Sander",
+    "Drill Press",
+    "COTS",
+    "FormLabs SLA",
+    "FormLabs SLS",
+    "Countersinking",
+    "Threaded Insert",
+    "Tapping",
+    "Guided Drilling",
+    "Bending",
+    "Bridgeport",
+)
 MACHINE_NAME_ALIASES = {
-    "bambu3dprinter": "Bambu 3D Printer",
-    "formlabssla": "FormLabs SLA",
-    "formlabssls": "FormLabs SLS",
-    "haas": "Haas CNC",
-    "haascnc": "Haas CNC",
-    "markforged3dprinter": "Markforged 3D Printer",
-    "shopsabre": "Shop Sabre CNC",
-    "shopsabrecnc": "Shop Sabre CNC",
+    re.sub(r"[^a-z0-9]+", "", name.casefold()): name
+    for name in BASEROW_MACHINE_NAMES
 }
+MACHINE_NAME_ALIASES.update(
+    {
+        "haas": "Haas CNC",
+        "shopsabre": "Shop Sabre CNC",
+    }
+)
 
 
 @dataclass(frozen=True)

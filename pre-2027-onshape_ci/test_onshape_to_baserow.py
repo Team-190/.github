@@ -1045,6 +1045,13 @@ class FileExportTests(unittest.TestCase):
 
 
 class RecordBuildingTests(unittest.TestCase):
+    def test_every_baserow_machine_name_is_normalized_case_insensitively(self):
+        for machine in MODULE.BASEROW_MACHINE_NAMES:
+            with self.subTest(machine=machine):
+                self.assertEqual(
+                    MODULE.operation_machine_name(machine.swapcase()), machine
+                )
+
     def test_part_operation_metadata_uses_immutable_configured_source_and_cache(self):
         item_source = {
             "documentId": "1" * 24,
