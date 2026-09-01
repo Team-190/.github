@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import sys
 import tempfile
@@ -1361,6 +1362,81 @@ class RecordBuildingTests(unittest.TestCase):
 
 
 class BaserowClientTests(unittest.TestCase):
+    def test_root_revision_gate_matches_baserow_and_checks_discovery_membership(self):
+        released = MODULE.released_assembly_from_revision(
+            revision("B", VID_B, partNumber="A-ROOT-ONE")
+        )
+        discovery_master = "https://cad.onshape.com/documents/master/w/main/e/assembly"
+
+        class Client:
+            def list_rows(self, table_id):
+                self.table_id = table_id
+                return [
+                    {
+                        "Assembly Number": "A-ROOT-ONE",
+                        "Latest Released Revision": "B",
+                        "Discovery Master": discovery_master,
+                        "Integration Status": "Discovered — Master Unreleased",
+                    }
+                ]
+
+        client = Client()
+        env = {
+            "BASEROW_API_URL": "https://api.baserow.test/api",
+            "BASEROW_TOKEN": "test",
+            "BASEROW_ASSEMBLIES_TABLE_ID": "4",
+        }
+        with patch.dict(os.environ, env), patch.object(
+            MODULE, "BaserowClient", return_value=client
+        ):
+            self.assertTrue(
+                MODULE.all_root_revisions_are_current(
+                    [released], discovery_master
+                )
+            )
+
+        self.assertEqual(client.table_id, 4)
+
+    def test_root_revision_gate_detects_changed_revision_or_discovery_membership(self):
+        released = MODULE.released_assembly_from_revision(
+            revision("C", VID_B, partNumber="A-ROOT-ONE")
+        )
+        discovery_master = "https://cad.onshape.com/documents/master/w/main/e/assembly"
+
+        class Client:
+            def list_rows(self, table_id):
+                return [
+                    {
+                        "Assembly Number": "A-ROOT-ONE",
+                        "Latest Released Revision": "B",
+                        "Discovery Master": discovery_master,
+                        "Integration Status": "Discovered — Master Unreleased",
+                    },
+                    {
+                        "Assembly Number": "A-ROOT-TWO",
+                        "Latest Released Revision": "D",
+                        "Discovery Master": discovery_master,
+                        "Integration Status": "Discovered — Master Unreleased",
+                    },
+                ]
+
+        env = {
+            "BASEROW_API_URL": "https://api.baserow.test/api",
+            "BASEROW_TOKEN": "test",
+            "BASEROW_ASSEMBLIES_TABLE_ID": "4",
+        }
+        with patch.dict(os.environ, env), patch.object(
+            MODULE, "BaserowClient", return_value=Client()
+        ):
+            self.assertFalse(MODULE.all_root_revisions_are_current([released]))
+
+            same_revision = replace(released, revision="B")
+            self.assertFalse(
+                MODULE.all_root_revisions_are_current(
+                    [same_revision], discovery_master
+                )
+            )
+
     def test_batch_create_error_includes_response_and_machine_values(self):
         response = RejectingResponse(
             {
@@ -1406,6 +1482,26 @@ class BaserowClientTests(unittest.TestCase):
 
 
 class MultiRootSyncTests(unittest.TestCase):
+    def test_unchanged_production_run_stops_before_fetching_root_bom(self):
+        released = MODULE.released_assembly_from_revision(
+            revision("B", VID_B, partNumber="A-ROOT-ONE")
+        )
+
+        with patch.object(
+            MODULE, "resolve_latest_released_assembly", return_value=released
+        ), patch.object(
+            MODULE, "all_root_revisions_are_current", return_value=True
+        ) as revision_gate, patch.object(
+            MODULE, "fetch_bom", side_effect=AssertionError("BOM fetched")
+        ), patch.object(
+            MODULE, "sync_to_baserow", side_effect=AssertionError("full sync started")
+        ):
+            result = MODULE.run_sync([target()], ["P-190B-26"])
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["roots_checked"], 1)
+        revision_gate.assert_called_once()
+
     def test_bad_list_root_is_logged_and_remaining_root_syncs(self):
         bad_target = target()
         good_target = MODULE.OnshapeTarget(

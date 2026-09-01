@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Synchronize an Onshape multilevel BOM into Baserow.
 
-Engineering-owned fields are updated on every run. Manufacturing status, machine,
-machinist, finishing, location, QC, and disposition are intentionally untouched.
+Engineering-owned fields are updated when a manufacturing-root revision changes.
+Manufacturing status, machine, machinist, finishing, location, QC, and disposition
+are intentionally untouched.
 """
 
 from __future__ import annotations
@@ -1471,6 +1472,49 @@ class BaserowClient:
         return payload
 
 
+def all_root_revisions_are_current(
+    released_roots: list[ReleasedAssembly], discovery_master: str = ""
+) -> bool:
+    """Return whether Baserow already represents every resolved root revision."""
+    client = BaserowClient(
+        require_env("BASEROW_API_URL"), require_env("BASEROW_TOKEN")
+    )
+    assemblies_table_id = int(require_env("BASEROW_ASSEMBLIES_TABLE_ID"))
+    rows = client.list_rows(assemblies_table_id)
+    rows_by_number = {
+        normalized_part_number(row.get("Assembly Number")): row
+        for row in rows
+        if str(row.get("Assembly Number") or "").strip()
+    }
+
+    root_numbers = {
+        normalized_part_number(released.part_number) for released in released_roots
+    }
+    for released in released_roots:
+        revision = str(released.revision or "").strip()
+        current = rows_by_number.get(normalized_part_number(released.part_number))
+        if (
+            not revision
+            or current is None
+            or str(current.get("Latest Released Revision") or "").strip()
+            != revision
+        ):
+            return False
+
+    if discovery_master:
+        previously_present = {
+            normalized_part_number(row.get("Assembly Number"))
+            for row in rows
+            if str(row.get("Discovery Master") or "").strip() == discovery_master
+            and str(row.get("Integration Status") or "").strip()
+            != "Missing from Main — Review"
+        }
+        if previously_present != root_numbers:
+            return False
+
+    return True
+
+
 def aggregate_export_key(exports: list[FileExport]) -> str:
     encoded = "\n".join(sorted(export.source_key for export in exports)).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -1745,6 +1789,8 @@ def sync_to_baserow(
         assembly_fields = ("Assembly Number", "Active")
         upsert_table(client, table_ids["assemblies"], "Assembly Number", assemblies, assembly_fields)
         assembly_rows = client.list_rows(table_ids["assemblies"])
+        root_assembly_fields: tuple[str, ...] = ()
+        supported_assembly_records: list[dict] = []
         if assembly_records:
             available_assembly_fields = {
                 field for row in assembly_rows for field in row
@@ -1772,15 +1818,6 @@ def sync_to_baserow(
                 }
                 for assembly in assembly_records
             ]
-            if root_assembly_fields:
-                upsert_table(
-                    client,
-                    table_ids["assemblies"],
-                    "Assembly Number",
-                    supported_assembly_records,
-                    root_assembly_fields,
-                )
-                assembly_rows = client.list_rows(table_ids["assemblies"])
 
         missing_from_master = []
         if discovery_master and assembly_rows:
@@ -2028,6 +2065,18 @@ def sync_to_baserow(
         if deactivate_operations:
             client.batch_update(table_ids["operations"], deactivate_operations)
 
+        # Record the root revision only after the dependent tables succeed. This
+        # value is the next run's early-exit marker, so writing it earlier could
+        # hide a partial failure and prevent a retry.
+        if root_assembly_fields:
+            upsert_table(
+                client,
+                table_ids["assemblies"],
+                "Assembly Number",
+                supported_assembly_records,
+                root_assembly_fields,
+            )
+
         summary = {
             "created": created,
             "updated": updated,
@@ -2213,12 +2262,36 @@ def run_sync(
                 "Baserow was not changed"
             )
 
-    for root_reference, released in root_sources:
+    resolved_root_numbers: set[str] = set()
+    for _, released in root_sources:
         source_root = released.part_number.strip()
         if not source_root:
             raise RuntimeError(
                 "Released manufacturing-root assembly has no Part number"
             )
+        normalized_root = normalized_part_number(source_root)
+        if normalized_root in resolved_root_numbers:
+            raise ValueError(
+                f"Manufacturing root {source_root} is configured more than once"
+            )
+        resolved_root_numbers.add(normalized_root)
+
+    if not dry_run and all_root_revisions_are_current(
+        [released for _, released in root_sources], discovery_master_url
+    ):
+        result = {
+            "skipped": True,
+            "reason": "All manufacturing-root revisions are already current",
+            "roots_checked": len(root_sources),
+            "source_revisions": [
+                released.as_dict() for _, released in root_sources
+            ],
+        }
+        print(json.dumps(result, indent=2))
+        return result
+
+    for root_reference, released in root_sources:
+        source_root = released.part_number.strip()
         if source_root in seen_roots:
             raise ValueError(
                 f"Manufacturing root {source_root} is configured more than once"

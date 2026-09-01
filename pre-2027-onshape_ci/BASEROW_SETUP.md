@@ -16,6 +16,14 @@ and every resolved root gets an Assemblies row even when it has no matching
 production parts. A manual `subassembly_urls` input can replace the configured
 list with one or more comma- or newline-separated URLs.
 
+Production runs compare those resolved root revisions with the Assemblies table
+before fetching any released-root BOM. If every revision is already current,
+the run stops there without reading part metadata or drawings, exporting files,
+or reading and writing the remaining Baserow tables. A new or changed root runs
+the complete synchronization. Main-discovery mode also runs the complete sync
+when a child is removed from or re-added to Main. Dry runs intentionally bypass
+this shortcut so they continue to produce a complete validation artifact.
+
 If one configured URL cannot be resolved, list mode logs a warning containing
 the exact URL and error, skips that root, and continues syncing the others. The
 skipped root's existing Baserow requirements are left unchanged. If none of the
