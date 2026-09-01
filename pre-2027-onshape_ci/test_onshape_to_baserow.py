@@ -1135,6 +1135,18 @@ class RecordBuildingTests(unittest.TestCase):
 
         self.assertEqual(warnings, [])
         self.assertEqual(
+            {
+                f"Machine OP{index}": requirements[0][f"Machine OP{index}"]
+                for index in range(1, 5)
+            },
+            {
+                "Machine OP1": "hAaS CnC",
+                "Machine OP2": "bAMbu 3D pRinter",
+                "Machine OP3": "sHoPsAbRe",
+                "Machine OP4": None,
+            },
+        )
+        self.assertEqual(
             [
                 (operation["Operation Number"], operation["Machine"])
                 for operation in operations
@@ -1146,6 +1158,102 @@ class RecordBuildingTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all("OP4" not in operation["Operation"] for operation in operations))
+
+    def test_operation_statuses_gate_each_route_on_its_predecessor(self):
+        operations = [
+            {
+                "Operation": "route-a|OP2",
+                "production_key": "route-a",
+                "Operation Number": "OP2",
+            },
+            {
+                "Operation": "route-a|OP1",
+                "production_key": "route-a",
+                "Operation Number": "OP1",
+            },
+            {
+                "Operation": "route-b|OP3",
+                "production_key": "route-b",
+                "Operation Number": "OP3",
+            },
+        ]
+
+        statuses = MODULE.operation_statuses_for_routes(operations, [])
+
+        self.assertEqual(
+            statuses,
+            {
+                "route-a|OP1": "Ready",
+                "route-a|OP2": "Planned",
+                "route-b|OP3": "Ready",
+            },
+        )
+
+    def test_operation_statuses_unlock_next_op_and_preserve_work_states(self):
+        operations = [
+            {
+                "Operation": "route-a|OP1",
+                "production_key": "route-a",
+                "Operation Number": "OP1",
+            },
+            {
+                "Operation": "route-a|OP2",
+                "production_key": "route-a",
+                "Operation Number": "OP2",
+            },
+            {
+                "Operation": "route-a|OP3",
+                "production_key": "route-a",
+                "Operation Number": "OP3",
+            },
+        ]
+        existing_rows = [
+            {
+                "Operation": "route-a|OP1",
+                "Status": {"id": 1, "value": "Complete"},
+            },
+            {
+                "Operation": "route-a|OP2",
+                "Status": {"id": 2, "value": "Planned"},
+            },
+            {
+                "Operation": "route-a|OP3",
+                "Status": {"id": 3, "value": "Blocked"},
+            },
+        ]
+
+        statuses = MODULE.operation_statuses_for_routes(
+            operations, existing_rows
+        )
+
+        self.assertEqual(statuses["route-a|OP1"], "Complete")
+        self.assertEqual(statuses["route-a|OP2"], "Ready")
+        self.assertEqual(statuses["route-a|OP3"], "Blocked")
+
+    def test_operation_statuses_hide_a_prematurely_ready_downstream_op(self):
+        operations = [
+            {
+                "Operation": "route-a|OP1",
+                "production_key": "route-a",
+                "Operation Number": "OP1",
+            },
+            {
+                "Operation": "route-a|OP2",
+                "production_key": "route-a",
+                "Operation Number": "OP2",
+            },
+        ]
+        existing_rows = [
+            {"Operation": "route-a|OP1", "Status": "In Progress"},
+            {"Operation": "route-a|OP2", "Status": "Ready"},
+        ]
+
+        statuses = MODULE.operation_statuses_for_routes(
+            operations, existing_rows
+        )
+
+        self.assertEqual(statuses["route-a|OP1"], "In Progress")
+        self.assertEqual(statuses["route-a|OP2"], "Planned")
 
     def test_custom_bom_header_display_name_is_available_for_operations(self):
         normalized = MODULE.normalize_bom_rows(
@@ -1445,6 +1553,10 @@ class MultiRootSyncTests(unittest.TestCase):
                             "Production Key": "old-one",
                             "Source Root": "A-ROOT-ONE",
                             "Assembly": [{"id": 10, "value": "A-ROOT-ONE"}],
+                            "Machine OP1": None,
+                            "Machine OP2": None,
+                            "Machine OP3": None,
+                            "Machine OP4": None,
                             "Active in BOM": True,
                         },
                         {
@@ -1474,7 +1586,7 @@ class MultiRootSyncTests(unittest.TestCase):
                             "Production Requirement": [{"id": 30}],
                             "Operation Number": "OP4",
                             "Machine": "Haas CNC",
-                            "Operation Status": "In Progress",
+                            "Status": "In Progress",
                             "Active in Routing": True,
                         },
                         {
@@ -1483,7 +1595,7 @@ class MultiRootSyncTests(unittest.TestCase):
                             "Production Requirement": [{"id": 31}],
                             "Operation Number": "OP4",
                             "Machine": "Haas CNC",
-                            "Operation Status": "In Progress",
+                            "Status": "In Progress",
                             "Active in Routing": True,
                         },
                     ],
@@ -1527,6 +1639,10 @@ class MultiRootSyncTests(unittest.TestCase):
             "Required Quantity": 1,
             "BOM Positions": "1",
             "Onshape Source": "https://example/one",
+            "Machine OP1": "Haas CNC",
+            "Machine OP2": "tapping",
+            "Machine OP3": None,
+            "Machine OP4": None,
             "Active in BOM": True,
         }
         env = {
@@ -1590,7 +1706,7 @@ class MultiRootSyncTests(unittest.TestCase):
         )
         self.assertEqual(created_operation["Operation Number"], "OP1")
         self.assertEqual(created_operation["Machine"], "Haas CNC")
-        self.assertNotIn("Operation Status", created_operation)
+        self.assertEqual(created_operation["Status"], "Ready")
         assembly_updates = [
             row
             for table_id, rows in client.updates
@@ -1616,6 +1732,10 @@ class MultiRootSyncTests(unittest.TestCase):
         )
         self.assertTrue(root_row["Active"])
         self.assertEqual(created_requirement["Assembly"], [root_row["id"]])
+        self.assertEqual(created_requirement["Machine OP1"], "Haas CNC")
+        self.assertEqual(created_requirement["Machine OP2"], "tapping")
+        self.assertIsNone(created_requirement["Machine OP3"])
+        self.assertIsNone(created_requirement["Machine OP4"])
 
 
 if __name__ == "__main__":

@@ -1185,6 +1185,17 @@ def operation_machines_from_row(row: dict) -> tuple[tuple[str, str], ...]:
     return tuple(operations)
 
 
+def production_requirement_machine_fields(row: dict) -> dict:
+    """Return the released Onshape routing values without machine aliases."""
+    fields = {}
+    for index, property_name in enumerate(OPERATION_PROPERTY_NAMES, start=1):
+        machine = str(row_property(row, property_name) or "").strip()
+        if normalized_property_name(machine) in ("", "none", "selectvalue"):
+            machine = None
+        fields[f"Machine OP{index}"] = machine
+    return fields
+
+
 def build_operation_records(requirements: list[dict]) -> list[dict]:
     """Expand each requirement's released Onshape routing into operation rows."""
     operations = []
@@ -1203,6 +1214,54 @@ def build_operation_records(requirements: list[dict]) -> list[dict]:
                 }
             )
     return operations
+
+
+def select_option_value(value) -> str:
+    """Return the displayed value from a Baserow single-select response."""
+    if isinstance(value, dict):
+        value = value.get("value")
+    return str(value or "").strip()
+
+
+def operation_sequence(operation: dict) -> int:
+    """Return the numeric position of an OP1 through OP4 operation."""
+    label = select_option_value(operation.get("Operation Number")).upper()
+    if label.startswith("OP") and label[2:].isdigit():
+        return int(label[2:])
+    return 999
+
+
+def operation_statuses_for_routes(
+    operations: list[dict], existing_rows: list[dict]
+) -> dict[str, str]:
+    """Gate each operation on completion of the preceding active route step.
+
+    Planned and Ready are sync-managed queue states. Manufacturing-owned states
+    are preserved, including In Progress, Blocked, Needs Rework, and Complete.
+    """
+    existing_by_key = {
+        str(row.get("Operation") or ""): row for row in existing_rows
+    }
+    routes: dict[str, list[dict]] = {}
+    for operation in operations:
+        production_key = str(operation.get("production_key") or "").strip()
+        routes.setdefault(production_key, []).append(operation)
+
+    statuses = {}
+    for route in routes.values():
+        predecessor_complete = True
+        for operation in sorted(route, key=operation_sequence):
+            operation_key = str(operation.get("Operation") or "")
+            current_status = select_option_value(
+                existing_by_key.get(operation_key, {}).get("Status")
+            )
+            if current_status in ("", "Planned", "Ready"):
+                status = "Ready" if predecessor_complete else "Planned"
+            else:
+                status = current_status
+            statuses[operation_key] = status
+            predecessor_complete = status == "Complete"
+    return statuses
 
 
 def build_records(
@@ -1224,6 +1283,7 @@ def build_records(
         assembly_number = str(row.get("assemblyNumber") or "").strip()
         source_url, configuration = source_url_and_configuration(row.get("itemSource"))
         operation_machines = operation_machines_from_row(row)
+        requirement_machine_fields = production_requirement_machine_fields(row)
         part = {
             "Part Number": part_number,
             "Name": str(row.get("name") or "").strip(),
@@ -1272,6 +1332,7 @@ def build_records(
                 "positions": [],
                 "Onshape Source": source_url,
                 "Active in BOM": True,
+                **requirement_machine_fields,
                 "_operation_machines": operation_machines,
             },
         )
@@ -1538,6 +1599,8 @@ def comparable(value):
                 item = item.get("id", item.get("name", item))
             normalized.append(json.dumps(item, sort_keys=True, default=str))
         return sorted(normalized)
+    if isinstance(value, dict) and "value" in value:
+        return comparable(value.get("value"))
     return value if value is not None else ""
 
 
@@ -1775,6 +1838,10 @@ def sync_to_baserow(
             "Required Quantity",
             "BOM Positions",
             "Onshape Source",
+            "Machine OP1",
+            "Machine OP2",
+            "Machine OP3",
+            "Machine OP4",
             "Active in BOM",
             )
             if not available_requirement_fields
@@ -1842,6 +1909,10 @@ def sync_to_baserow(
             str(row.get("Production Key") or ""): row
             for row in client.list_rows(table_ids["requirements"])
         }
+        existing_operations = client.list_rows(table_ids["operations"])
+        operation_statuses = operation_statuses_for_routes(
+            operations, existing_operations
+        )
         desired_operations = []
         for operation in operations:
             production_key = str(operation.get("production_key") or "")
@@ -1857,6 +1928,9 @@ def sync_to_baserow(
                     for key, value in {
                         **operation,
                         "Production Requirement": [requirement_row["id"]],
+                        "Status": operation_statuses[
+                            str(operation.get("Operation") or "")
+                        ],
                     }.items()
                     if key != "production_key"
                 }
@@ -1866,6 +1940,7 @@ def sync_to_baserow(
             "Production Requirement",
             "Operation Number",
             "Machine",
+            "Status",
             "Active in Routing",
         )
         operations_created, operations_updated, operations_unchanged = upsert_table(

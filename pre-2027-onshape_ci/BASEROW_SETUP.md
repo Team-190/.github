@@ -1,11 +1,13 @@
 # Onshape to Baserow setup
 
-The sync writes only engineering-owned fields. It never updates manufacturing
-status, machine, machinist, finishing, current location, QC outcome, or
-disposition on an existing production requirement.
-On the Operations table it updates only the released Onshape routing fields;
-operation status, machinist, instructions, timestamps, and notes remain
-manufacturing-owned.
+The sync writes only engineering-owned fields. It updates the four `Machine OP`
+fields from released Onshape routing metadata, but never updates manufacturing
+status, machinist, finishing, current location, QC outcome, or disposition on
+an existing production requirement.
+On the Operations table it updates the released Onshape routing fields and
+manages only the `Planned`/`Ready` operation queue gate; machinist,
+in-progress/exception/completion status, instructions, timestamps, and notes
+remain manufacturing-owned.
 
 The poot-horse workflow defaults to `USE_SUBASSEMBLY_LIST=true` and reads the
 manufacturing-root URLs stored in `DEFAULT_ONSHAPE_SUBASSEMBLY_URLS` in the
@@ -107,6 +109,10 @@ value before the first sync, including `SELECT VALUE:` during migration.
 - `Drawing` — lookup of `Onshape Drawing` through `Part`
 - `Drawing PDF` — lookup of `Drawing PDF` through `Part`
 - `STEP File` — lookup of `STEP File` through `Part`
+- `Machine OP1` — single select; direct value of `Manufacturing Method`
+- `Machine OP2` — single select; direct value of `Manufacturing Method OP2`
+- `Machine OP3` — single select; direct value of `Manufacturing Method OP3`
+- `Machine OP4` — single select; direct value of `Manufacturing Method OP4`
 - `Status` — single select; default `Needs Drawing`
 - `Machine` — single select
 - `Machinist` — text
@@ -138,7 +144,7 @@ Status choices:
 - `Operation Number` — text or single select with exactly `OP1`, `OP2`, `OP3`,
   and `OP4`
 - `Machine` — single select or text
-- `Operation Status` — single select; default `Planned`
+- `Status` — single select; default `Planned`
 - `Machinist` — text or collaborator
 - `Work Instructions` — long text
 - `Started At` — date with time
@@ -147,7 +153,7 @@ Status choices:
 - `Active in Routing` — boolean; required so removed Onshape operations can be
   retained for history but hidden from active queues
 
-Operation Status choices:
+Status choices:
 
 1. Planned
 2. Ready
@@ -168,17 +174,25 @@ The released Onshape properties map to the fixed operation labels as follows:
 The sync reads these values from each part's immutable released-version metadata,
 so the custom properties do not need to be visible columns in the assembly BOM.
 Property names and values are matched case-insensitively. `None` creates no
-operation. Every configured Baserow machine choice is normalized to its exact
-capitalization. These additional aliases are also supported:
+operation. The corresponding `Machine OP1` through `Machine OP4` fields on the
+Production Requirements table receive the original Onshape values without
+machine aliases or capitalization changes. For Operations rows, every configured
+Baserow machine choice is normalized to its exact capitalization. These
+additional aliases are also supported:
 
 - `Haas CNC` or `Haas` becomes `Haas CNC`
 - `ShopSabre`, `Shop Sabre`, or `Shop Sabre CNC` becomes `Shop Sabre CNC`
 
 The sync creates and updates `Operation`, `Production Requirement`, `Operation
-Number`, `Machine`, and `Active in Routing`. It never overwrites `Operation
-Status`, `Machinist`, `Work Instructions`, `Started At`, `Completed At`, or
-`Notes`. When an Onshape operation is changed to `None`, its existing Baserow
-row is marked inactive instead of being deleted.
+Number`, `Machine`, `Status`, and `Active in Routing`. Within each requirement's
+active route, the first configured operation is `Ready`; each later operation is
+`Planned` until its preceding operation is `Complete`. On subsequent syncs, a
+`Planned` operation is promoted to `Ready` when its predecessor is complete, and
+a prematurely ready downstream operation is returned to `Planned`. The sync
+preserves `In Progress`, `Blocked`, `Needs Rework`, and `Complete`, as well as
+`Machinist`, `Work Instructions`, `Started At`, `Completed At`, and `Notes`.
+When an Onshape operation is changed to `None`, its existing Baserow row is
+marked inactive instead of being deleted.
 
 ### Sync Runs
 
