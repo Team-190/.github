@@ -46,6 +46,22 @@ STEP_EXPORT_METHODS = frozenset(
         "FormLabs SLS",
     )
 )
+OPERATION_PROPERTY_NAMES = (
+    "Manufacturing Method",
+    "Manufacturing Method OP2",
+    "Manufacturing Method OP3",
+    "Manufacturing Method OP4",
+)
+MACHINE_NAME_ALIASES = {
+    "bambu3dprinter": "Bambu 3D Printer",
+    "formlabssla": "FormLabs SLA",
+    "formlabssls": "FormLabs SLS",
+    "haas": "Haas",
+    "haascnc": "Haas",
+    "markforged3dprinter": "Markforged 3D Printer",
+    "shopsabre": "Shop Sabre CNC",
+    "shopsabrecnc": "Shop Sabre CNC",
+}
 
 
 @dataclass(frozen=True)
@@ -424,7 +440,7 @@ def resolve_latest_released_assembly(target: OnshapeTarget) -> ReleasedAssembly:
 
 def normalize_bom_rows(headers: list[dict], rows: list[dict]) -> list[dict]:
     """Decode v16 BOM cells from header IDs into their property names."""
-    property_names = {}
+    property_names: dict[str, tuple[str, ...]] = {}
     for header in headers:
         if not isinstance(header, dict):
             continue
@@ -434,9 +450,18 @@ def normalize_bom_rows(headers: list[dict], rows: list[dict]) -> list[dict]:
             or header.get("propertyId")
             or ""
         ).strip()
-        property_name = str(header.get("propertyName") or "").strip()
-        if header_id and property_name:
-            property_names[header_id] = property_name
+        names = tuple(
+            dict.fromkeys(
+                name
+                for name in (
+                    str(header.get("propertyName") or "").strip(),
+                    str(header.get("name") or "").strip(),
+                )
+                if name
+            )
+        )
+        if header_id and names:
+            property_names[header_id] = names
 
     normalized = []
     for original in rows:
@@ -457,8 +482,7 @@ def normalize_bom_rows(headers: list[dict], rows: list[dict]) -> list[dict]:
                 "define property names"
             )
         for header_id, value in values.items():
-            property_name = property_names.get(str(header_id))
-            if property_name:
+            for property_name in property_names.get(str(header_id), ()):
                 row[property_name] = value
         normalized.append(row)
     return normalized
@@ -518,10 +542,19 @@ def indent_level(row: dict) -> int:
         return 0
 
 
-def is_assembly_row(row: dict) -> bool:
+def assembly_number(row: dict) -> str:
+    """Return the released assembly identity, preferring Part Number."""
     name = str(row.get("name") or "").strip()
     part_number = str(row.get("partNumber") or "").strip()
-    return bool(ASSEMBLY_NAME_RE.match(name)) and part_number.upper() in ("", "N/A")
+    if ASSEMBLY_NAME_RE.match(part_number):
+        return part_number
+    if ASSEMBLY_NAME_RE.match(name) and part_number.upper() in ("", "N/A"):
+        return name
+    return ""
+
+
+def is_assembly_row(row: dict) -> bool:
+    return bool(assembly_number(row))
 
 
 def annotate_assemblies(
@@ -536,7 +569,7 @@ def annotate_assemblies(
         while stack and stack[-1][0] >= level:
             stack.pop()
         if is_assembly_row(row):
-            stack.append((level, str(row.get("name") or "").strip()))
+            stack.append((level, assembly_number(row)))
         row["assemblyNumber"] = (
             stack[-1][1] if stack else root_assembly_number
         )
@@ -547,7 +580,7 @@ def annotate_assemblies(
 def assembly_revisions(items: list[dict]) -> dict[str, str]:
     """Return assembly revisions captured by an immutable released BOM."""
     return {
-        str(row.get("name") or "").strip(): str(row.get("revision") or "").strip()
+        assembly_number(row): str(row.get("revision") or "").strip()
         for row in items
         if is_assembly_row(row)
     }
@@ -645,27 +678,27 @@ def discover_released_manufacturing_roots(
     for row in items:
         if not is_assembly_row(row) or indent_level(row) != 0:
             continue
-        assembly_number = str(row.get("name") or "").strip()
+        discovered_number = assembly_number(row)
         reference = source_document_reference(
             row.get("itemSource"), master_target.base_url
         )
         if reference is None:
             warnings.append(
                 f"Could not resolve the source document for direct child "
-                f"{assembly_number}; manufacturing root skipped"
+                f"{discovered_number}; manufacturing root skipped"
             )
             continue
-        candidates.setdefault(assembly_number, set()).add(reference)
+        candidates.setdefault(discovered_number, set()).add(reference)
 
     roots: list[tuple[OnshapeDocumentReference, ReleasedAssembly]] = []
-    for assembly_number in sorted(candidates):
-        references = candidates[assembly_number]
+    for candidate_number in sorted(candidates):
+        references = candidates[candidate_number]
         document_keys = {
             (reference.base_url, reference.did) for reference in references
         }
         if len(document_keys) != 1:
             warnings.append(
-                f"Direct child {assembly_number} resolves to multiple documents; "
+                f"Direct child {candidate_number} resolves to multiple documents; "
                 "manufacturing root skipped"
             )
             continue
@@ -679,11 +712,11 @@ def discover_released_manufacturing_roots(
             ),
         )[0]
         latest = fetch_latest_discovered_assembly_revision(
-            reference, assembly_number
+            reference, candidate_number
         )
         if not latest or not str(latest.get("versionId") or "").strip():
             warnings.append(
-                f"Direct child {assembly_number} has no released assembly revision; "
+                f"Direct child {candidate_number} has no released assembly revision; "
                 "existing Baserow requirements were left unchanged"
             )
             continue
@@ -691,11 +724,11 @@ def discover_released_manufacturing_roots(
         if (
             released.part_number
             and normalized_part_number(released.part_number)
-            != normalized_part_number(assembly_number)
+            != normalized_part_number(candidate_number)
         ):
             raise RuntimeError(
                 "Onshape latest-revision response returned a different part number "
-                f"for discovered child {assembly_number}"
+                f"for discovered child {candidate_number}"
             )
         roots.append((reference, released))
 
@@ -1003,6 +1036,135 @@ def number_value(value: Decimal):
     return int(value) if value == value.to_integral_value() else float(value)
 
 
+def normalized_property_name(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def row_property(row: dict, property_name: str):
+    """Read an Onshape BOM property without depending on key casing or spacing."""
+    wanted = normalized_property_name(property_name)
+    for key, value in row.items():
+        if normalized_property_name(key) == wanted:
+            return value
+    return None
+
+
+def operation_machine_name(value) -> str:
+    """Return the exact Baserow machine choice for an Onshape method value."""
+    machine = str(value or "").strip()
+    normalized = normalized_property_name(machine)
+    if normalized in ("", "none", "selectvalue"):
+        return ""
+    return MACHINE_NAME_ALIASES.get(normalized, machine)
+
+
+def fetch_part_metadata(item_source: dict, default_base_url: str) -> dict | None:
+    """Read immutable metadata for one released BOM part/configuration."""
+    reference = source_document_reference(item_source, default_base_url)
+    element_id = str(item_source.get("elementId") or "").strip()
+    part_id = str(item_source.get("partId") or "").strip()
+    if reference is None or not element_id or not part_id:
+        return None
+    _, configuration = source_url_and_configuration(item_source)
+    endpoint = (
+        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/metadata/d/{reference.did}/"
+        f"{reference.wvm_type}/{reference.wvm_id}/e/{quote(element_id, safe='')}/"
+        f"p/{quote(part_id, safe='')}"
+    )
+    params = {
+        "includeComputedProperties": "true",
+        "thumbnail": "false",
+    }
+    if configuration != "default":
+        params["configuration"] = configuration
+    return onshape_get_json(f"{endpoint}?{urlencode(params)}")
+
+
+def operation_metadata_values(payload: dict) -> dict[str, object]:
+    values = {}
+    properties = payload.get("properties")
+    if not isinstance(properties, list):
+        raise RuntimeError("Unexpected Onshape part metadata: no properties array")
+    for prop in properties:
+        if not isinstance(prop, dict):
+            continue
+        name = str(prop.get("name") or prop.get("displayName") or "").strip()
+        if name:
+            values[normalized_property_name(name)] = prop.get("value")
+    return values
+
+
+def hydrate_operation_properties(
+    items: list[dict], prefixes: list[str], default_base_url: str
+) -> list[dict]:
+    """Overlay released part metadata so operation properties need not be BOM columns."""
+    cache: dict[tuple, dict | None] = {}
+    hydrated = []
+    for original in items:
+        row = dict(original)
+        part_number = str(row.get("partNumber") or "").strip()
+        item_source = row.get("itemSource")
+        if part_number and (
+            not prefixes or any(part_number.startswith(prefix) for prefix in prefixes)
+        ) and isinstance(item_source, dict):
+            reference = source_document_reference(item_source, default_base_url)
+            element_id = str(item_source.get("elementId") or "").strip()
+            part_id = str(item_source.get("partId") or "").strip()
+            _, configuration = source_url_and_configuration(item_source)
+            if reference is not None and element_id and part_id:
+                cache_key = (
+                    reference.base_url,
+                    reference.did,
+                    reference.wvm_type,
+                    reference.wvm_id,
+                    element_id,
+                    part_id,
+                    configuration,
+                )
+                if cache_key not in cache:
+                    cache[cache_key] = fetch_part_metadata(
+                        item_source, default_base_url
+                    )
+                metadata = cache[cache_key]
+                if metadata is not None:
+                    metadata_values = operation_metadata_values(metadata)
+                    for property_name in OPERATION_PROPERTY_NAMES:
+                        property_key = normalized_property_name(property_name)
+                        if property_key in metadata_values:
+                            row[property_name] = metadata_values[property_key]
+        hydrated.append(row)
+    return hydrated
+
+
+def operation_machines_from_row(row: dict) -> tuple[tuple[str, str], ...]:
+    operations = []
+    for index, property_name in enumerate(OPERATION_PROPERTY_NAMES, start=1):
+        machine = operation_machine_name(row_property(row, property_name))
+        if machine:
+            operations.append((f"OP{index}", machine))
+    return tuple(operations)
+
+
+def build_operation_records(requirements: list[dict]) -> list[dict]:
+    """Expand each requirement's released Onshape routing into operation rows."""
+    operations = []
+    for requirement in requirements:
+        production_key = str(requirement.get("Production Key") or "").strip()
+        if not production_key:
+            continue
+        for operation_number, machine in requirement.get("_operation_machines", ()):
+            operations.append(
+                {
+                    "Operation": f"{production_key}|{operation_number}",
+                    "production_key": production_key,
+                    "Operation Number": operation_number,
+                    "Machine": machine,
+                    "Active in Routing": True,
+                }
+            )
+    return operations
+
+
 def build_records(
     items: list[dict],
     prefixes: list[str],
@@ -1021,6 +1183,7 @@ def build_records(
 
         assembly_number = str(row.get("assemblyNumber") or "").strip()
         source_url, configuration = source_url_and_configuration(row.get("itemSource"))
+        operation_machines = operation_machines_from_row(row)
         part = {
             "Part Number": part_number,
             "Name": str(row.get("name") or "").strip(),
@@ -1069,8 +1232,16 @@ def build_records(
                 "positions": [],
                 "Onshape Source": source_url,
                 "Active in BOM": True,
+                "_operation_machines": operation_machines,
             },
         )
+        existing_machines = tuple(requirement.get("_operation_machines") or ())
+        if existing_machines and operation_machines and existing_machines != operation_machines:
+            warnings.append(
+                f"Conflicting manufacturing operations for {part_number} in {key}"
+            )
+        elif not existing_machines and operation_machines:
+            requirement["_operation_machines"] = operation_machines
         requirement["Required Quantity"] += decimal_quantity(row.get("quantity"))
         position = str(row.get("item") or "").strip()
         if position and position not in requirement["positions"]:
@@ -1334,6 +1505,17 @@ def changed(existing: dict, desired: dict, fields: tuple[str, ...]) -> bool:
     return any(comparable(existing.get(field)) != comparable(desired.get(field)) for field in fields)
 
 
+def linked_row_ids(value) -> set[int]:
+    ids = set()
+    for item in value if isinstance(value, list) else []:
+        row_id = item.get("id") if isinstance(item, dict) else item
+        try:
+            ids.add(int(row_id))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
 def upsert_table(
     client: BaserowClient,
     table_id: int,
@@ -1363,6 +1545,7 @@ def sync_to_baserow(
     source_rows: int,
     exports_by_part: dict[str, list[FileExport]],
     sync_cad_files: bool,
+    operations: list[dict] | None = None,
     assembly_records: list[dict] | None = None,
     synced_roots: set[str] | None = None,
     discovery_master: str = "",
@@ -1372,6 +1555,7 @@ def sync_to_baserow(
         "sync": int(require_env("BASEROW_SYNC_RUNS_TABLE_ID")),
         "parts": int(require_env("BASEROW_PARTS_TABLE_ID")),
         "requirements": int(require_env("BASEROW_REQUIREMENTS_TABLE_ID")),
+        "operations": int(require_env("BASEROW_OPERATIONS_TABLE_ID")),
         "assemblies": int(require_env("BASEROW_ASSEMBLIES_TABLE_ID")),
     }
     started = utc_now()
@@ -1379,6 +1563,7 @@ def sync_to_baserow(
     try:
         now = utc_now()
         assembly_records = assembly_records or []
+        operations = operations or []
         synced_roots = synced_roots or {
             str(requirement.get("Source Root") or "")
             for requirement in requirements
@@ -1522,7 +1707,11 @@ def sync_to_baserow(
         }
         desired_requirements = []
         for requirement in requirements:
-            fields = {k: v for k, v in requirement.items() if k not in ("part_number", "assembly_number")}
+            fields = {
+                k: v
+                for k, v in requirement.items()
+                if k not in ("part_number", "assembly_number", "_operation_machines")
+            }
             fields["Part"] = [part_ids[requirement["part_number"]]]
             fields["Assembly"] = [assembly_ids[requirement["assembly_number"]]] if requirement["assembly_number"] else []
             fields["Last Synced At"] = now
@@ -1609,6 +1798,64 @@ def sync_to_baserow(
         if deactivate:
             client.batch_update(table_ids["requirements"], deactivate)
 
+        requirement_rows_by_key = {
+            str(row.get("Production Key") or ""): row
+            for row in client.list_rows(table_ids["requirements"])
+        }
+        desired_operations = []
+        for operation in operations:
+            production_key = str(operation.get("production_key") or "")
+            requirement_row = requirement_rows_by_key.get(production_key)
+            if requirement_row is None:
+                raise RuntimeError(
+                    f"No Baserow Production Requirement row found for operation "
+                    f"{operation.get('Operation') or '(unnamed)'}"
+                )
+            desired_operations.append(
+                {
+                    key: value
+                    for key, value in {
+                        **operation,
+                        "Production Requirement": [requirement_row["id"]],
+                    }.items()
+                    if key != "production_key"
+                }
+            )
+
+        operation_fields = (
+            "Production Requirement",
+            "Operation Number",
+            "Machine",
+            "Active in Routing",
+        )
+        operations_created, operations_updated, operations_unchanged = upsert_table(
+            client,
+            table_ids["operations"],
+            "Operation",
+            desired_operations,
+            operation_fields,
+        )
+        desired_operation_keys = {
+            operation["Operation"] for operation in desired_operations
+        }
+        synced_requirement_ids = {
+            int(row["id"])
+            for row in requirement_rows_by_key.values()
+            if str(row.get("Source Root") or "").strip() in synced_roots
+        }
+        deactivate_operations = [
+            {"id": row["id"], "Active in Routing": False}
+            for row in client.list_rows(table_ids["operations"])
+            if row.get("Operation") not in desired_operation_keys
+            and row.get("Active in Routing") is not False
+            and bool(
+                linked_row_ids(row.get("Production Requirement"))
+                & synced_requirement_ids
+            )
+        ]
+        if deactivate_operations:
+            client.batch_update(table_ids["operations"], deactivate_operations)
+
         summary = {
             "created": created,
             "updated": updated,
@@ -1617,6 +1864,10 @@ def sync_to_baserow(
             "roots_missing_from_master": len(missing_from_master),
             "file_groups_uploaded": files_uploaded,
             "file_groups_cached": files_cached,
+            "operations_created": operations_created,
+            "operations_updated": operations_updated,
+            "operations_unchanged": operations_unchanged,
+            "operations_deactivated": len(deactivate_operations),
         }
         warnings = sorted(set(warnings))
         client.update_one(table_ids["sync"], run["id"], {
@@ -1787,6 +2038,9 @@ def run_sync(
 
         released_target = released.bom_target(root_reference.base_url)
         raw_items = fetch_bom(released_target)
+        raw_items = hydrate_operation_properties(
+            raw_items, prefixes, root_reference.base_url
+        )
         root_parts, root_requirements, root_warnings = build_records(
             raw_items,
             prefixes,
@@ -1876,6 +2130,7 @@ def run_sync(
         )
 
     parts = merge_root_parts(part_groups, warning_items)
+    operations = build_operation_records(requirements)
     exports_by_part = merge_root_exports(export_groups)
     warnings = sorted(set(warning_items))
     planned_exports = [
@@ -1894,6 +2149,7 @@ def run_sync(
         f"Onshape rows={sum(len(result['items']) for result in root_results)} "
         f"roots={len(root_results)} parts={len(parts)} "
         f"production_requirements={len(requirements)} "
+        f"operations={len(operations)} "
         f"drawings={sum(result['drawing_count'] for result in root_results)} "
         f"pdf_exports={sum(e.field_name == DRAWING_PDF_FIELD for e in planned_exports)} "
         f"step_exports={sum(e.field_name == STEP_FILE_FIELD for e in planned_exports)}"
@@ -1917,7 +2173,22 @@ def run_sync(
             "source_rows": sum(len(root["items"]) for root in root_results),
             "assemblies": assembly_records,
             "parts": parts,
-            "requirements": requirements,
+            "requirements": [
+                {
+                    key: value
+                    for key, value in requirement.items()
+                    if key != "_operation_machines"
+                }
+                for requirement in requirements
+            ],
+            "operations": [
+                {
+                    key: value
+                    for key, value in operation.items()
+                    if key != "production_key"
+                }
+                for operation in operations
+            ],
             "file_exports": {
                 part_number: [
                     {
@@ -1950,6 +2221,7 @@ def run_sync(
         source_rows=sum(len(root["items"]) for root in root_results),
         exports_by_part=exports_by_part,
         sync_cad_files=sync_cad_files,
+        operations=operations,
         assembly_records=assembly_records,
         synced_roots=seen_roots,
         discovery_master=discovery_master_url,

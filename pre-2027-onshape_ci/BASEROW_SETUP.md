@@ -3,6 +3,9 @@
 The sync writes only engineering-owned fields. It never updates manufacturing
 status, machine, machinist, finishing, current location, QC outcome, or
 disposition on an existing production requirement.
+On the Operations table it updates only the released Onshape routing fields;
+operation status, machinist, instructions, timestamps, and notes remain
+manufacturing-owned.
 
 `ONSHAPE_DOC_URL` points to the master assembly tab in Main. The master does not
 need to be released. Its workspace BOM is used only to discover direct `A-...`
@@ -10,8 +13,11 @@ child assemblies; nested assemblies are intentionally ignored so their parts
 are not counted twice.
 
 For every discovered direct child, the sync uses the child row's source
-document and assembly number to resolve its latest released assembly revision
-(`et=1`). Production requirements are built only from that child's immutable
+document and `A-...` Part Number to resolve its latest released assembly
+revision (`et=1`). The assembly Name remains descriptive subsystem metadata; for
+example, Name `A-26C-0001` may have released Part Number `A-190B-261132`.
+Legacy rows with an `A-...` Name and blank or `N/A` Part Number are still
+recognized. Production requirements are built only from that child's immutable
 released document/version/element/configuration coordinates. A child without a
 release is skipped with a warning, and its existing Baserow requirements are
 left unchanged. If no released direct children can be resolved, the run fails
@@ -26,6 +32,7 @@ The Delta workflow is configured for these Baserow tables:
 | Sync Runs | 1119639 |
 | Parts | 1119641 |
 | Production Requirements | 1119642 |
+| Operations | repository variable `BASEROW_OPERATIONS_TABLE_ID` |
 | Storage Locations | 1119643 |
 | Assemblies | 1119645 |
 
@@ -114,6 +121,56 @@ Status choices:
 7. Ready for Finishing
 8. Complete
 
+### Operations
+
+- `Operation` — primary text; generated as `<Production Key>|OP1` through `OP4`
+- `Production Requirement` — link to Production Requirements; keep the related
+  field enabled and allow multiple relationships so one requirement can own
+  multiple operation rows
+- `Operation Number` — text or single select with exactly `OP1`, `OP2`, `OP3`,
+  and `OP4`
+- `Machine` — single select or text
+- `Operation Status` — single select; default `Planned`
+- `Machinist` — text or collaborator
+- `Work Instructions` — long text
+- `Started At` — date with time
+- `Completed At` — date with time
+- `Notes` — long text
+- `Active in Routing` — boolean; required so removed Onshape operations can be
+  retained for history but hidden from active queues
+
+Operation Status choices:
+
+1. Planned
+2. Ready
+3. In Progress
+4. Blocked
+5. Needs Rework
+6. Complete
+
+The released Onshape properties map to the fixed operation labels as follows:
+
+| Onshape property | Operation Number |
+|---|---|
+| `Manufacturing Method` | `OP1` |
+| `Manufacturing Method OP2` | `OP2` |
+| `Manufacturing Method OP3` | `OP3` |
+| `Manufacturing Method OP4` | `OP4` |
+
+The sync reads these values from each part's immutable released-version metadata,
+so the custom properties do not need to be visible columns in the assembly BOM.
+Property names and values are matched case-insensitively. `None` creates no
+operation. Machine names are copied from Onshape except for these aliases:
+
+- `Haas CNC` or `Haas` becomes `Haas`
+- `ShopSabre`, `Shop Sabre`, or `Shop Sabre CNC` becomes `Shop Sabre CNC`
+
+The sync creates and updates `Operation`, `Production Requirement`, `Operation
+Number`, `Machine`, and `Active in Routing`. It never overwrites `Operation
+Status`, `Machinist`, `Work Instructions`, `Started At`, `Completed At`, or
+`Notes`. When an Onshape operation is changed to `None`, its existing Baserow
+row is marked inactive instead of being deleted.
+
 ### Sync Runs
 
 - `Started At` — primary date with time
@@ -131,14 +188,19 @@ Status choices:
 ## Baserow token
 
 Create a database token with read, create, and update access to Assemblies,
-Parts, Production Requirements, and Sync Runs. Add it to the GitHub repository
+Parts, Production Requirements, Operations, and Sync Runs. Add it to the GitHub repository
 as an Actions secret named `BASEROW_TOKEN`. Do not commit or paste the token.
 The poot-horse workflow also uses this token to upload PDF and STEP files to
 Baserow before attaching them to Parts rows.
 
-For Baserow Cloud, no repository variable is necessary. For self-hosting, add a
-repository Actions variable named `BASEROW_API_URL`, for example
+For Baserow Cloud, no `BASEROW_API_URL` repository variable is necessary. For
+self-hosting, add a repository Actions variable named `BASEROW_API_URL`, for example
 `https://baserow.example.org/api`.
+
+Add a repository Actions variable named `BASEROW_OPERATIONS_TABLE_ID` containing
+the numeric Operations table ID from its Baserow URL. Both production workflows
+require this variable; dry runs do not call Baserow and therefore do not require
+it.
 
 Create `ONSHAPE_DOC_URL_DELTA` and `ONSHAPE_DOC_URL_EPSILON` repository Actions
 secrets containing the applicable master assembly Main-workspace URLs. No
@@ -149,7 +211,8 @@ manufacturing-root URL-list secrets are required.
 Both Baserow workflows have a manual `dry_run` input. A dry run requires the
 Onshape URL and Onshape API credentials, but no Baserow credentials. It performs
 release and BOM resolution, builds all records, skips every Baserow API call,
-and uploads `onshape-baserow-dry-run.json` as a workflow artifact. The dry-run
+and uploads `onshape-baserow-dry-run.json` as a workflow artifact. The artifact
+includes the planned Operations rows. The dry-run
 job is separate from the production job and is not given the Baserow URL, token,
 or table IDs. When `SYNC_CAD_FILES=true`, the dry-run artifact lists the planned
 PDF and STEP filenames but does not start Onshape translations or upload files.

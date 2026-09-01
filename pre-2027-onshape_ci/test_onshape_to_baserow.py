@@ -245,8 +245,8 @@ class ReleaseResolutionTests(unittest.TestCase):
         unreleased_did = "3" * 24
         rows = [
             {
-                "name": "A-DIRECT",
-                "partNumber": "N/A",
+                "name": "A-26C-0001",
+                "partNumber": "A-190B-261132",
                 "indentLevel": 0,
                 "itemSource": {
                     "documentId": direct_did,
@@ -255,8 +255,8 @@ class ReleaseResolutionTests(unittest.TestCase):
                 },
             },
             {
-                "name": "A-NESTED",
-                "partNumber": "N/A",
+                "name": "A-26C-0002",
+                "partNumber": "A-190B-261133",
                 "indentLevel": 1,
                 "itemSource": {
                     "documentId": nested_did,
@@ -265,8 +265,8 @@ class ReleaseResolutionTests(unittest.TestCase):
                 },
             },
             {
-                "name": "A-DIRECT",
-                "partNumber": "N/A",
+                "name": "A-26C-0001",
+                "partNumber": "A-190B-261132",
                 "indentLevel": 0,
                 "itemSource": {
                     "documentId": direct_did,
@@ -275,8 +275,8 @@ class ReleaseResolutionTests(unittest.TestCase):
                 },
             },
             {
-                "name": "A-UNRELEASED",
-                "partNumber": "N/A",
+                "name": "A-26C-0003",
+                "partNumber": "A-190B-261134",
                 "indentLevel": 0,
                 "itemSource": {
                     "documentId": unreleased_did,
@@ -287,7 +287,7 @@ class ReleaseResolutionTests(unittest.TestCase):
         ]
 
         def latest(reference, part_number):
-            if part_number == "A-UNRELEASED":
+            if part_number == "A-190B-261134":
                 return None
             return revision(
                 "B",
@@ -306,13 +306,15 @@ class ReleaseResolutionTests(unittest.TestCase):
                 target(), rows
             )
 
-        self.assertEqual([root.part_number for _, root in roots], ["A-DIRECT"])
+        self.assertEqual(
+            [root.part_number for _, root in roots], ["A-190B-261132"]
+        )
         self.assertEqual(
             {call.args[1] for call in fetch_latest.call_args_list},
-            {"A-DIRECT", "A-UNRELEASED"},
+            {"A-190B-261132", "A-190B-261134"},
         )
-        self.assertTrue(any("A-UNRELEASED" in warning for warning in warnings))
-        self.assertFalse(any("A-NESTED" in warning for warning in warnings))
+        self.assertTrue(any("A-190B-261134" in warning for warning in warnings))
+        self.assertFalse(any("A-190B-261133" in warning for warning in warnings))
 
     def test_discovered_child_without_release_handles_204(self):
         reference = MODULE.OnshapeDocumentReference(
@@ -322,11 +324,11 @@ class ReleaseResolutionTests(unittest.TestCase):
             MODULE.requests, "get", return_value=FakeResponse(None, 204), create=True
         ) as get, patch.object(MODULE, "onshape_headers", return_value={}):
             latest = MODULE.fetch_latest_discovered_assembly_revision(
-                reference, "A-DIRECT"
+                reference, "A-190B-261132"
             )
 
         self.assertIsNone(latest)
-        self.assertIn("/p/A-DIRECT/latest?et=1", get.call_args.args[0])
+        self.assertIn("/p/A-190B-261132/latest?et=1", get.call_args.args[0])
 
     def test_bom_is_fetched_from_immutable_released_version(self):
         released = MODULE.released_assembly_from_revision(
@@ -404,6 +406,8 @@ class ReleaseResolutionTests(unittest.TestCase):
                     [],
                 ),
             ), patch.object(
+                MODULE, "fetch_part_metadata", return_value={"properties": []}
+            ), patch.object(
                 MODULE, "sync_to_baserow", side_effect=AssertionError("Baserow called")
             ):
                 MODULE.run_sync(
@@ -433,6 +437,9 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(saved["requirements"][0]["Configuration"], "width=0.5+meter")
         self.assertEqual(saved["requirements"][0]["Required Quantity"], 2)
         self.assertEqual(saved["requirements"][0]["BOM Positions"], "1.2")
+        self.assertEqual(len(saved["operations"]), 1)
+        self.assertEqual(saved["operations"][0]["Operation Number"], "OP1")
+        self.assertEqual(saved["operations"][0]["Machine"], "Haas")
         self.assertEqual(
             {export["field"] for export in saved["file_exports"]["P-190B-260100"]},
             {MODULE.DRAWING_PDF_FIELD, MODULE.STEP_FILE_FIELD},
@@ -978,6 +985,118 @@ class FileExportTests(unittest.TestCase):
 
 
 class RecordBuildingTests(unittest.TestCase):
+    def test_part_operation_metadata_uses_immutable_configured_source_and_cache(self):
+        item_source = {
+            "documentId": "1" * 24,
+            "wvmType": "v",
+            "wvmId": "2" * 24,
+            "elementId": "3" * 24,
+            "partId": "JHD",
+            "configuration": "Length=2+inch",
+        }
+        rows = [
+            {
+                "partNumber": "P-190B-260100",
+                "itemSource": item_source,
+            },
+            {
+                "partNumber": "P-190B-260100",
+                "itemSource": item_source,
+            },
+        ]
+        metadata = {
+            "properties": [
+                {"name": "manufacturing method", "value": "HAAS CNC"},
+                {"name": "Manufacturing Method OP2", "value": "ShopSabre"},
+            ]
+        }
+
+        with patch.object(
+            MODULE, "fetch_part_metadata", return_value=metadata
+        ) as fetch_metadata:
+            hydrated = MODULE.hydrate_operation_properties(
+                rows, ["P-190B-26"], "https://frc190.onshape.com"
+            )
+
+        self.assertEqual(fetch_metadata.call_count, 1)
+        self.assertEqual(
+            MODULE.operation_machines_from_row(hydrated[0]),
+            (("OP1", "Haas"), ("OP2", "Shop Sabre CNC")),
+        )
+
+    def test_part_metadata_request_includes_configuration(self):
+        item_source = {
+            "documentId": "1" * 24,
+            "wvmType": "v",
+            "wvmId": "2" * 24,
+            "elementId": "3" * 24,
+            "partId": "JHD",
+            "configuration": "Length=2+inch",
+        }
+        with patch.object(
+            MODULE, "onshape_get_json", return_value={"properties": []}
+        ) as get:
+            MODULE.fetch_part_metadata(item_source, "https://frc190.onshape.com")
+
+        url = get.call_args.args[0]
+        self.assertIn("/metadata/d/", url)
+        self.assertIn("/e/" + "3" * 24 + "/p/JHD", url)
+        self.assertIn("configuration=Length%3D2%2Binch", url)
+
+    def test_operations_use_op_labels_case_insensitive_properties_and_aliases(self):
+        rows = [
+            {
+                "item": "1",
+                "quantity": "1",
+                "partNumber": "P-190B-260100",
+                "name": "ROUTED PART",
+                "MaNuFaCtUrInG MeThOd": "hAaS CnC",
+                "manufacturing_method_op2": "bAMbu 3D pRinter",
+                "Manufacturing Method OP3": "sHoPsAbRe",
+                "Manufacturing Method OP4": "nOnE",
+                "itemSource": source("https://example/direct", 0),
+            }
+        ]
+        _, requirements, warnings = MODULE.build_records(
+            rows,
+            ["P-190B-26"],
+            source_root="A-190B-260001",
+            source_revision="B",
+        )
+
+        operations = MODULE.build_operation_records(requirements)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            [
+                (operation["Operation Number"], operation["Machine"])
+                for operation in operations
+            ],
+            [
+                ("OP1", "Haas"),
+                ("OP2", "Bambu 3D Printer"),
+                ("OP3", "Shop Sabre CNC"),
+            ],
+        )
+        self.assertTrue(all("OP4" not in operation["Operation"] for operation in operations))
+
+    def test_custom_bom_header_display_name_is_available_for_operations(self):
+        normalized = MODULE.normalize_bom_rows(
+            [
+                {
+                    "id": "custom-op2",
+                    "name": "Manufacturing Method OP2",
+                    "propertyName": "opaqueCustomPropertyId",
+                }
+            ],
+            [{"headerIdToValue": {"custom-op2": "SHOP SABRE"}}],
+        )
+
+        self.assertEqual(
+            MODULE.operation_machines_from_row(normalized[0]),
+            (("OP2", "Shop Sabre CNC"),),
+        )
+
     def test_direct_parts_are_assigned_to_released_manufacturing_root(self):
         rows = [
             {
@@ -1219,7 +1338,13 @@ class MultiRootSyncTests(unittest.TestCase):
         )
 
     def test_deactivation_is_limited_to_the_current_source_root(self):
-        table_ids = {"sync": 1, "parts": 2, "requirements": 3, "assemblies": 4}
+        table_ids = {
+            "sync": 1,
+            "parts": 2,
+            "requirements": 3,
+            "assemblies": 4,
+            "operations": 5,
+        }
         desired_part = {
             "Part Number": "P-190B-260101",
             "Name": "ONE",
@@ -1275,6 +1400,26 @@ class MultiRootSyncTests(unittest.TestCase):
                             "Active in BOM": True,
                         },
                     ],
+                    table_ids["operations"]: [
+                        {
+                            "id": 40,
+                            "Operation": "stale-current-root",
+                            "Production Requirement": [{"id": 30}],
+                            "Operation Number": "OP4",
+                            "Machine": "Haas",
+                            "Operation Status": "In Progress",
+                            "Active in Routing": True,
+                        },
+                        {
+                            "id": 41,
+                            "Operation": "stale-other-root",
+                            "Production Requirement": [{"id": 31}],
+                            "Operation Number": "OP4",
+                            "Machine": "Haas",
+                            "Operation Status": "In Progress",
+                            "Active in Routing": True,
+                        },
+                    ],
                 }
                 self.updates = []
                 self.next_id = 100
@@ -1324,7 +1469,9 @@ class MultiRootSyncTests(unittest.TestCase):
             "BASEROW_PARTS_TABLE_ID": "2",
             "BASEROW_REQUIREMENTS_TABLE_ID": "3",
             "BASEROW_ASSEMBLIES_TABLE_ID": "4",
+            "BASEROW_OPERATIONS_TABLE_ID": "5",
         }
+        operation_key = requirement["Production Key"] + "|OP1"
 
         with patch.dict(os.environ, env), patch.object(
             MODULE, "BaserowClient", return_value=client
@@ -1336,6 +1483,15 @@ class MultiRootSyncTests(unittest.TestCase):
                 source_rows=1,
                 exports_by_part={},
                 sync_cad_files=False,
+                operations=[
+                    {
+                        "Operation": operation_key,
+                        "production_key": requirement["Production Key"],
+                        "Operation Number": "OP1",
+                        "Machine": "Haas",
+                        "Active in Routing": True,
+                    }
+                ],
                 synced_roots={"A-ROOT-ONE"},
                 discovery_master="https://example/master",
             )
@@ -1352,6 +1508,22 @@ class MultiRootSyncTests(unittest.TestCase):
             if row.get("Active in BOM") is False
         }
         self.assertEqual(deactivated_ids, {30, 32})
+        operation_updates = [
+            row
+            for table_id, rows in client.updates
+            if table_id == table_ids["operations"]
+            for row in rows
+        ]
+        self.assertIn({"id": 40, "Active in Routing": False}, operation_updates)
+        self.assertNotIn({"id": 41, "Active in Routing": False}, operation_updates)
+        created_operation = next(
+            row
+            for row in client.rows[table_ids["operations"]]
+            if row["Operation"] == operation_key
+        )
+        self.assertEqual(created_operation["Operation Number"], "OP1")
+        self.assertEqual(created_operation["Machine"], "Haas")
+        self.assertNotIn("Operation Status", created_operation)
         assembly_updates = [
             row
             for table_id, rows in client.updates
