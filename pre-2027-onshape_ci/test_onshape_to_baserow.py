@@ -467,6 +467,10 @@ class ReleaseResolutionTests(unittest.TestCase):
             ), patch.object(
                 MODULE, "fetch_part_metadata", return_value={"properties": []}
             ), patch.object(
+                MODULE,
+                "fetch_document_metadata",
+                return_value={"name": "A-26C-0001"},
+            ), patch.object(
                 MODULE, "sync_to_baserow", side_effect=AssertionError("Baserow called")
             ):
                 MODULE.run_sync(
@@ -496,6 +500,9 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(saved["requirements"][0]["Configuration"], "width=0.5+meter")
         self.assertEqual(saved["requirements"][0]["Required Quantity"], 2)
         self.assertEqual(saved["requirements"][0]["BOM Positions"], "1.2")
+        self.assertEqual(
+            saved["requirements"][0]["Source Document"], "A-26C-0001"
+        )
         self.assertEqual(len(saved["assemblies"]), 1)
         self.assertEqual(
             saved["assemblies"][0]["Assembly Number"], "A-190B-260001"
@@ -543,6 +550,142 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(saved["source_revision"]["version_id"], VID_B)
         self.assertEqual(saved["parts"][0]["Revision"], "C")
         self.assertEqual(saved["requirements"][0]["Required Quantity"], 2)
+
+
+class SourceDocumentTests(unittest.TestCase):
+    def test_document_metadata_uses_get_document_endpoint(self):
+        document_id = "1" * 24
+        with patch.object(
+            MODULE,
+            "onshape_get_json",
+            return_value={"id": document_id, "name": "A-26C-0001"},
+        ) as get_json:
+            metadata = MODULE.fetch_document_metadata(
+                "https://frc190.onshape.com", document_id
+            )
+
+        self.assertEqual(metadata["name"], "A-26C-0001")
+        get_json.assert_called_once_with(
+            f"https://frc190.onshape.com/api/v16/documents/{document_id}"
+        )
+
+    def test_names_propagate_and_metadata_is_cached_per_document(self):
+        shared_did = "1" * 24
+        other_did = "2" * 24
+        other_vid = "3" * 24
+        other_eid = "4" * 24
+        rows = [
+            {
+                "item": "1",
+                "quantity": 1,
+                "partNumber": "P-190B-260101",
+                "itemSource": {"documentId": shared_did},
+            },
+            {
+                "item": "2",
+                "quantity": 1,
+                "partNumber": "P-190B-260102",
+                "itemSource": {"documentId": shared_did},
+            },
+            {
+                "item": "3",
+                "quantity": 1,
+                "partNumber": "P-190B-260103",
+                "itemSource": {
+                    "viewHref": (
+                        f"https://frc190.onshape.com/documents/{other_did}/v/"
+                        f"{other_vid}/e/{other_eid}"
+                    )
+                },
+            },
+        ]
+
+        def metadata_for(_base_url, document_id):
+            return {
+                "name": (
+                    "A-26C-0001"
+                    if document_id == shared_did
+                    else "A-26C-0002"
+                )
+            }
+
+        with patch.object(
+            MODULE, "fetch_document_metadata", side_effect=metadata_for
+        ) as fetch_metadata:
+            names, warnings = MODULE.source_document_names_for_rows(
+                rows, ["P-190B-26"], "https://cad.onshape.com"
+            )
+        _, requirements, build_warnings = MODULE.build_records(
+            rows,
+            ["P-190B-26"],
+            source_document_names=names,
+        )
+
+        self.assertEqual(fetch_metadata.call_count, 2)
+        self.assertEqual(
+            [call.args[1] for call in fetch_metadata.call_args_list],
+            [shared_did, other_did],
+        )
+        by_part = {
+            requirement["part_number"]: requirement["Source Document"]
+            for requirement in requirements
+        }
+        self.assertEqual(by_part["P-190B-260101"], "A-26C-0001")
+        self.assertEqual(by_part["P-190B-260102"], "A-26C-0001")
+        self.assertEqual(by_part["P-190B-260103"], "A-26C-0002")
+        self.assertEqual(warnings, [])
+        self.assertEqual(build_warnings, [])
+
+    def test_missing_source_and_unavailable_metadata_warn_without_failing(self):
+        unavailable_did = "5" * 24
+        rows = [
+            {
+                "item": "1",
+                "quantity": 1,
+                "partNumber": "P-190B-260201",
+            },
+            {
+                "item": "2",
+                "quantity": 1,
+                "partNumber": "P-190B-260202",
+                "itemSource": {"documentId": unavailable_did},
+            },
+            {
+                "item": "3",
+                "quantity": 1,
+                "partNumber": "P-190B-260203",
+                "itemSource": {"documentId": unavailable_did},
+            },
+        ]
+
+        with patch.object(
+            MODULE,
+            "fetch_document_metadata",
+            side_effect=RuntimeError("document access denied"),
+        ) as fetch_metadata:
+            names, warnings = MODULE.source_document_names_for_rows(
+                rows, ["P-190B-26"], "https://cad.onshape.com"
+            )
+        _, requirements, _ = MODULE.build_records(
+            rows,
+            ["P-190B-26"],
+            source_document_names=names,
+        )
+
+        self.assertEqual(fetch_metadata.call_count, 1)
+        self.assertEqual(names, {})
+        self.assertTrue(
+            all(requirement["Source Document"] == "" for requirement in requirements)
+        )
+        for part_number in (
+            "P-190B-260201",
+            "P-190B-260202",
+            "P-190B-260203",
+        ):
+            self.assertTrue(
+                any(part_number in warning for warning in warnings),
+                warnings,
+            )
 
 
 class DrawingLinkTests(unittest.TestCase):
@@ -1366,6 +1509,63 @@ class RecordBuildingTests(unittest.TestCase):
 
 
 class BaserowClientTests(unittest.TestCase):
+    def test_source_document_is_engineering_managed_without_owned_fields(self):
+        class Client:
+            def __init__(self):
+                self.updated = []
+
+            def list_rows(self, table_id):
+                return [
+                    {
+                        "id": 7,
+                        "Production Key": "REQ-1",
+                        "Source Document": "A-26C-OLD",
+                        "Status": "On Machine",
+                        "Machinist": "Corey",
+                        "QC Outcome": "Not Inspected",
+                        "Disposition": "Make",
+                        "Claimed Quantity": 2,
+                        "Completed At": "2026-08-01T12:00:00Z",
+                    }
+                ]
+
+            def batch_create(self, table_id, rows):
+                raise AssertionError("The existing requirement should be updated")
+
+            def batch_update(self, table_id, rows):
+                self.updated.extend(rows)
+                return rows
+
+        client = Client()
+        desired = [
+            {
+                "Production Key": "REQ-1",
+                "Source Document": "A-26C-0001",
+            }
+        ]
+
+        created, updated, unchanged = MODULE.upsert_table(
+            client,
+            1119642,
+            "Production Key",
+            desired,
+            MODULE.PRODUCTION_REQUIREMENT_MANAGED_FIELDS,
+            change_flag_field="Engineering Changed",
+        )
+
+        self.assertEqual((created, updated, unchanged), (0, 1, 0))
+        self.assertEqual(client.updated[0]["Source Document"], "A-26C-0001")
+        self.assertTrue(client.updated[0]["Engineering Changed"])
+        for field in (
+            "Status",
+            "Machinist",
+            "QC Outcome",
+            "Disposition",
+            "Claimed Quantity",
+            "Completed At",
+        ):
+            self.assertNotIn(field, client.updated[0])
+
     def test_finishing_upsert_preserves_manually_assigned_machinist(self):
         class Client:
             def __init__(self):
@@ -1947,6 +2147,7 @@ class MultiRootSyncTests(unittest.TestCase):
             "Required Quantity": 1,
             "BOM Positions": "1",
             "Onshape Source": "https://example/one",
+            "Source Document": "A-26C-0001",
             "Machine OP1": "Haas CNC",
             "Machine OP2": "Tapping",
             "Machine OP3": None,
@@ -2047,6 +2248,11 @@ class MultiRootSyncTests(unittest.TestCase):
         self.assertIsNone(created_requirement["Machine OP3"])
         self.assertIsNone(created_requirement["Machine OP4"])
         self.assertEqual(created_requirement["Finishing"], "Red")
+        self.assertNotIn(
+            "Source Document",
+            created_requirement,
+            "Fields absent from the existing Baserow schema must stay filtered",
+        )
         finishing_row = next(
             row
             for row in client.rows[table_ids["finishing"]]

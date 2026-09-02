@@ -111,6 +111,11 @@ value before the first sync, including `SELECT VALUE:` during migration.
 
 ### Production Requirements
 
+Before running this sync version, a Baserow administrator must manually create
+a text field named exactly `Source Document` on Production Requirements table
+`1119642`. The sync does not create or modify Baserow schema. If the field is
+absent, compatibility filtering omits it from outgoing records.
+
 - `Production Key` — primary text
 - `Part` — link to one Parts row
 - `Assembly` — link to one Assemblies row
@@ -121,6 +126,7 @@ value before the first sync, including `SELECT VALUE:` during migration.
 - `Required Quantity` — number
 - `BOM Positions` — long text
 - `Onshape Source` — URL
+- `Source Document` — text; actual Onshape document name containing the part
 - `Drawing` — lookup of `Onshape Drawing` through `Part`
 - `Drawing PDF` — lookup of `Drawing PDF` through `Part`
 - `STEP File` — lookup of `STEP File` through `Part`

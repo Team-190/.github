@@ -59,7 +59,25 @@ HYDRATED_PART_PROPERTY_NAMES = (
     *OPERATION_PROPERTY_NAMES,
     POWDER_COAT_PROPERTY_NAME,
 )
-SYNC_SCHEMA_VERSION = "finishing-v1"
+SYNC_SCHEMA_VERSION = "source-document-v1"
+PRODUCTION_REQUIREMENT_MANAGED_FIELDS = (
+    "Part",
+    "Assembly",
+    "Source Root",
+    "Source Assembly Revision",
+    "Required Part Revision",
+    "Configuration",
+    "Required Quantity",
+    "BOM Positions",
+    "Onshape Source",
+    "Source Document",
+    "Machine OP1",
+    "Machine OP2",
+    "Machine OP3",
+    "Machine OP4",
+    "Finishing",
+    "Active in BOM",
+)
 BASEROW_MACHINE_NAMES = (
     "Haas CNC",
     "Shop Sabre CNC",
@@ -653,6 +671,107 @@ def source_url_and_configuration(value) -> tuple[str, str]:
         "configuration", [source_configuration or "default"]
     )[0]
     return url, configuration or "default"
+
+
+def item_source_document_id(value) -> str:
+    """Return an item source's document ID, including URL-only BOM sources."""
+    if isinstance(value, dict):
+        did = str(value.get("documentId") or "").strip()
+        url = str(value.get("viewHref") or value.get("href") or "").strip()
+    else:
+        did = ""
+        url = str(value or "").strip()
+    if did:
+        return did
+    match = re.search(
+        r"(?:^|/)documents/([a-fA-F0-9]{24})(?:/|$)",
+        urlparse(url).path,
+    )
+    return match.group(1) if match else ""
+
+
+def item_source_document_location(
+    value, default_base_url: str
+) -> tuple[str, str] | None:
+    """Return the Onshape host and document ID for a BOM item source."""
+    did = item_source_document_id(value)
+    if not did:
+        return None
+    if isinstance(value, dict):
+        url = str(value.get("viewHref") or value.get("href") or "").strip()
+    else:
+        url = str(value or "").strip()
+    parsed = urlparse(url)
+    base_url = (
+        f"{parsed.scheme}://{parsed.netloc}"
+        if parsed.scheme and parsed.netloc
+        else default_base_url.rstrip("/")
+    )
+    return base_url, did
+
+
+def fetch_document_metadata(base_url: str, document_id: str) -> dict:
+    """Fetch an Onshape document object, whose top-level name is the doc name."""
+    endpoint = (
+        f"{base_url.rstrip('/')}/api/{ONSHAPE_API_VERSION}/documents/"
+        f"{quote(document_id, safe='')}"
+    )
+    return onshape_get_json(endpoint)
+
+
+def source_document_names_for_rows(
+    items: list[dict],
+    prefixes: list[str],
+    default_base_url: str,
+    cache: dict[str, dict | None] | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve document names once per unique document used by matching parts."""
+    metadata_cache = cache if cache is not None else {}
+    document_names: dict[str, str] = {}
+    warnings: list[str] = []
+    for row in items:
+        part_number = str(row.get("partNumber") or "").strip()
+        if not part_number or (
+            prefixes and not any(part_number.startswith(prefix) for prefix in prefixes)
+        ):
+            continue
+        location = item_source_document_location(
+            row.get("itemSource"), default_base_url
+        )
+        if location is None:
+            warnings.append(
+                f"Could not resolve Source Document for {part_number}: itemSource "
+                "has no document ID; field left blank"
+            )
+            continue
+        base_url, document_id = location
+        if document_id not in metadata_cache:
+            try:
+                metadata_cache[document_id] = fetch_document_metadata(
+                    base_url, document_id
+                )
+            except Exception as exc:
+                metadata_cache[document_id] = None
+                warnings.append(
+                    f"Could not resolve Source Document for {part_number}: "
+                    f"document {document_id} metadata unavailable "
+                    f"({type(exc).__name__}: {exc}); field left blank"
+                )
+                continue
+        metadata = metadata_cache[document_id]
+        document_name = (
+            str(metadata.get("name") or "").strip()
+            if isinstance(metadata, dict)
+            else ""
+        )
+        if document_name:
+            document_names[document_id] = document_name
+        else:
+            warnings.append(
+                f"Could not resolve Source Document for {part_number}: document "
+                f"{document_id} metadata has no name or is unavailable; field left blank"
+            )
+    return document_names, sorted(set(warnings))
 
 
 def source_document_reference(
@@ -1287,6 +1406,7 @@ def build_records(
     *,
     source_root: str = "",
     source_revision: str = "",
+    source_document_names: dict[str, str] | None = None,
 ):
     parts: dict[str, dict] = {}
     requirements: dict[str, dict] = {}
@@ -1298,7 +1418,12 @@ def build_records(
             continue
 
         assembly_number = str(row.get("assemblyNumber") or "").strip()
-        source_url, configuration = source_url_and_configuration(row.get("itemSource"))
+        item_source = row.get("itemSource")
+        source_url, configuration = source_url_and_configuration(item_source)
+        source_document_id = item_source_document_id(item_source)
+        source_document = (source_document_names or {}).get(
+            source_document_id, ""
+        )
         operation_machines = operation_machines_from_row(row)
         requirement_machine_fields = production_requirement_machine_fields(row)
         part = {
@@ -1348,6 +1473,7 @@ def build_records(
                 "Required Quantity": Decimal("0"),
                 "positions": [],
                 "Onshape Source": source_url,
+                "Source Document": source_document,
                 "Finishing": powder_coat_color(
                     row_property(row, POWDER_COAT_PROPERTY_NAME)
                 ),
@@ -1356,6 +1482,19 @@ def build_records(
                 "_operation_machines": operation_machines,
             },
         )
+        existing_source_document = str(
+            requirement.get("Source Document") or ""
+        ).strip()
+        if (
+            existing_source_document
+            and source_document
+            and existing_source_document != source_document
+        ):
+            warnings.append(
+                f"Conflicting source documents for {part_number} in {key}"
+            )
+        elif not existing_source_document and source_document:
+            requirement["Source Document"] = source_document
         existing_machines = tuple(requirement.get("_operation_machines") or ())
         if existing_machines and operation_machines and existing_machines != operation_machines:
             warnings.append(
@@ -1947,23 +2086,7 @@ def sync_to_baserow(
 
         source_fields = tuple(
             field
-            for field in (
-            "Part",
-            "Assembly",
-            "Source Root",
-            "Source Assembly Revision",
-            "Required Part Revision",
-            "Configuration",
-            "Required Quantity",
-            "BOM Positions",
-            "Onshape Source",
-            "Machine OP1",
-            "Machine OP2",
-            "Machine OP3",
-            "Machine OP4",
-            "Finishing",
-            "Active in BOM",
-            )
+            for field in PRODUCTION_REQUIREMENT_MANAGED_FIELDS
             if not available_requirement_fields
             or field in available_requirement_fields
         )
@@ -2298,6 +2421,7 @@ def run_sync(
     discovery_master_url = ""
     master_workspace_items: list[dict] = []
     root_sources: list[tuple[OnshapeDocumentReference, ReleasedAssembly]] = []
+    document_metadata_cache: dict[str, dict | None] = {}
 
     if discover_from_master:
         if len(targets) != 1:
@@ -2393,11 +2517,18 @@ def run_sync(
         raw_items = hydrate_operation_properties(
             raw_items, prefixes, root_reference.base_url
         )
+        source_document_names, document_warnings = source_document_names_for_rows(
+            raw_items,
+            prefixes,
+            root_reference.base_url,
+            document_metadata_cache,
+        )
         root_parts, root_requirements, root_warnings = build_records(
             raw_items,
             prefixes,
             source_root=source_root,
             source_revision=released.revision,
+            source_document_names=source_document_names,
         )
         drawing_urls, drawing_warnings = drawing_urls_for_parts(
             raw_items,
@@ -2438,7 +2569,12 @@ def run_sync(
         part_groups.append(root_parts)
         requirements.extend(root_requirements)
         export_groups.append(root_exports)
-        warning_items.extend(root_warnings + drawing_warnings + export_warnings)
+        warning_items.extend(
+            document_warnings
+            + root_warnings
+            + drawing_warnings
+            + export_warnings
+        )
 
     master_released: ReleasedAssembly | None = None
     master_items: list[dict] = []
