@@ -3,53 +3,50 @@
 This is Team 190's org-wide `.github` repository. It provides:
 
 - **Org profile** — [`profile/README.md`](profile/README.md), shown on [github.com/Team-190](https://github.com/Team-190).
-- **Org-wide default templates** — [`PULL_REQUEST_TEMPLATE.md`](PULL_REQUEST_TEMPLATE.md) and [issue templates](.github/ISSUE_TEMPLATE), used automatically by any repo in the org that doesn't define its own. For code of conduct, contributing guidelines, security reporting, and support, see the [190 Software Knowledge Base](https://team-190.github.io/190-Software-Knowledge-Base/category/software-engineering-practices).
-- **Shared CI** — app integrations and general GitHub workflows (Onshape → Baserow BOM sync, GompeiLib sync) under [`.github/workflows`](.github/workflows).
+- **Org-wide default templates** — [`PULL_REQUEST_TEMPLATE.md`](PULL_REQUEST_TEMPLATE.md) and [issue templates](.github/ISSUE_TEMPLATE), used automatically by repositories that do not define their own. See the [190 Software Knowledge Base](https://team-190.github.io/190-Software-Knowledge-Base/category/software-engineering-practices) for contributing and security practices.
+- **Shared CI** — Onshape → Supabase BOM sync and GompeiLib workflows under [`.github/workflows`](.github/workflows).
 
-## Pre-merge Onshape BOM dry runs
+## Onshape engineering BOM sync
 
-An implementation branch can use the repository's existing Onshape Actions
-secrets without receiving any Baserow credentials:
+The sync resolves released manufacturing roots from either the configured URL
+list or direct children of a Main workspace. Only changed roots fetch released
+BOMs and drawing revisions. Engineering records and attachment catalogs are
+committed through one transactional RPC; shop workflow, assignments, QC,
+locations and production quantities remain shop-owned.
 
-```text
-gh workflow run onshape_baserow_delta.yml --ref <implementation-branch> -f dry_run=true
-gh workflow run onshape_baserow_poot_horse.yml --ref <implementation-branch> -f dry_run=true
-```
+See [Supabase setup and behavior](pre-2027-onshape_ci/SUPABASE_SETUP.md) for the
+unapplied migration, required secrets, ownership rules, failure handling and
+offline tests. No workflow applies database migrations.
 
-Each command checks out the selected branch, reads the unreleased master
-workspace to discover direct child assemblies, resolves each child's latest
-released BOM, and uploads the resulting JSON. The isolated dry-run job has no Baserow
-URL, token, or table IDs. Manual production jobs can run only from the default
-branch, while scheduled production syncs are unchanged.
+## Pre-merge dry runs
 
-The master workspace is discovery input only and does not define the production
-BOM. Each direct child's assembly number and source document are used to call
-the Onshape latest-revision API. The child revision's immutable
-document/version/element/configuration coordinates define its manufacturing
-baseline.
-
-For example, another master workspace can be tested without changing the
-poot_horse production secret:
+After approval to call Onshape, an implementation branch can use the existing
+Onshape Actions secrets without receiving any Supabase credentials:
 
 ```text
-gh workflow run onshape_baserow_poot_horse.yml \
-  --ref <implementation-branch> \
-  -f dry_run=true \
-  -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
+gh workflow run onshape_supabase_poot_horse.yml --ref <implementation-branch> -f dry_run=true
+gh workflow run onshape_supabase_delta.yml --ref <implementation-branch> -f dry_run=true
 ```
 
-The URL override is consumed as the discovery master by manual workflow runs,
-including production runs from the default branch. If omitted, the workflow
-uses its existing `ONSHAPE_DOC_URL_*` Main-workspace secret. Scheduled and
-repository-dispatch production runs always use that secret. Because
-`dry_run=false` writes to Baserow, validate the same override with a dry run
-before using it for production.
+Poot Horse defaults to the configured manufacturing-root URL list. Set
+`use_subassembly_list=false` to discover direct child assemblies from Main.
+Delta uses Main discovery. The master is discovery input, not the production
+baseline: each child's latest immutable released version supplies its BOM.
 
-After validation, a default-branch production override can be dispatched with:
+The dry-run job reads Onshape and uploads a JSON artifact to GitHub. It receives
+no Supabase URL or secret, never generates a missing Onshape BOM, and never
+starts a CAD translation or uploads to Storage. An uncached master BOM must be
+generated separately before a read-only dry run can inspect it.
+
+For a different Poot Horse discovery master, after approval:
 
 ```text
-gh workflow run onshape_baserow_poot_horse.yml \
-  --ref main \
-  -f dry_run=false \
-  -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
+gh workflow run onshape_supabase_poot_horse.yml --ref <implementation-branch> -f dry_run=true -f use_subassembly_list=false -f onshape_doc_url="https://frc190.onshape.com/documents/.../w/.../e/..."
 ```
+
+Manual production dispatches remain restricted to the default branch. Production
+runs require the migration and `NEXT_PUBLIC_SUPABASE_URL` and
+`SUPABASE_SECRET_KEY` GitHub Actions secrets. Repository dispatch types are
+`bom_sync_poot_horse_supabase` and `bom_sync_delta_supabase`; external dispatchers
+must be updated separately. The archived workflow under
+`pre-2027-onshape-ci-workflows` remains archived.

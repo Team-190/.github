@@ -1,0 +1,34 @@
+name: Test Onshape Supabase engineering sync
+
+on:
+  pull_request:
+    paths:
+      - 'pre-2027-onshape_ci/**'
+      - 'supabase/**'
+      - 'tests/**'
+      - '.github/workflows/onshape_supabase*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    name: Mocked Onshape and isolated PostgreSQL tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test resolution, dry runs and Supabase transport without live APIs
+        run: python -m unittest discover -s pre-2027-onshape_ci -p test_onshape_to_supabase.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install isolated PostgreSQL runtime
+        run: npm install --no-save --package-lock=false @electric-sql/pglite@0.3.14
+      - name: Test engineering transaction against contract fixtures
+        run: node tests/engineering-sync.test.mjs
+      - name: Test imported duplicates and missing revision markers
+        run: node tests/imported-sync.test.mjs

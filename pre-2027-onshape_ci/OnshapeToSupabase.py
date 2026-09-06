@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Synchronize an Onshape multilevel BOM into Baserow.
+"""Synchronize an Onshape multilevel BOM into Supabase.
 
 Engineering-owned fields are updated when a manufacturing-root revision changes.
 Manufacturing status, machinist, location, QC, and disposition are intentionally
-untouched. Released routing, powder-coat color, and their work queues are
-sync-managed.
+untouched. Released routing and powder-coat color are sync-managed.
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ import json
 import os
 import re
 import time
+import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -27,15 +28,12 @@ import requests
 
 
 ASSEMBLY_NAME_RE = re.compile(r"^A-[A-Za-z0-9-]+$")
-BATCH_SIZE = 100
 ONSHAPE_API_VERSION = "v16"
 ASSEMBLY_ELEMENT_TYPE = 1
 DRAWING_ELEMENT_TYPE = 2
 CAD_EXPORT_CACHE_VERSION = "v2"
 DRAWING_PDF_FIELD = "Drawing PDF"
-DRAWING_PDF_KEY_FIELD = "Drawing PDF Export Key"
 STEP_FILE_FIELD = "STEP File"
-STEP_KEY_FIELD = "STEP Export Key"
 EXPORT_POLL_SECONDS = (2, 4, 8, 10)
 STEP_EXPORT_METHODS = frozenset(
     method.casefold()
@@ -59,26 +57,9 @@ HYDRATED_PART_PROPERTY_NAMES = (
     *OPERATION_PROPERTY_NAMES,
     POWDER_COAT_PROPERTY_NAME,
 )
-SYNC_SCHEMA_VERSION = "source-document-v1"
-PRODUCTION_REQUIREMENT_MANAGED_FIELDS = (
-    "Part",
-    "Assembly",
-    "Source Root",
-    "Source Assembly Revision",
-    "Required Part Revision",
-    "Configuration",
-    "Required Quantity",
-    "BOM Positions",
-    "Onshape Source",
-    "Source Document",
-    "Machine OP1",
-    "Machine OP2",
-    "Machine OP3",
-    "Machine OP4",
-    "Finishing",
-    "Active in BOM",
-)
-BASEROW_MACHINE_NAMES = (
+SYNC_SCHEMA_VERSION = "supabase-engineering-v1"
+ONSHAPE_CALL_COUNTS: Counter[str] = Counter()
+MACHINE_NAMES = (
     "Haas CNC",
     "Shop Sabre CNC",
     "Milling Machine",
@@ -100,7 +81,7 @@ BASEROW_MACHINE_NAMES = (
 )
 MACHINE_NAME_ALIASES = {
     re.sub(r"[^a-z0-9]+", "", name.casefold()): name
-    for name in BASEROW_MACHINE_NAMES
+    for name in MACHINE_NAMES
 }
 MACHINE_NAME_ALIASES.update(
     {
@@ -143,7 +124,6 @@ class PartExportSource:
 class FileExport:
     part_number: str
     field_name: str
-    key_field_name: str
     source_key: str
     filename: str
     content_type: str
@@ -283,7 +263,52 @@ def onshape_headers(method: str, full_url: str) -> dict[str, str]:
     }
 
 
+def onshape_call_category(method: str, url: str) -> str:
+    """Return a stable, low-cardinality label for Onshape request telemetry."""
+    path = urlparse(url).path.rstrip("/")
+    query = parse_qs(urlparse(url).query)
+    if re.search(r"/assemblies/d/[^/]+/[wvm]/[^/]+/e/[^/]+/bom$", path):
+        return "bom"
+    if re.search(r"/metadata/d/[^/]+/[wvm]/[^/]+/e/[^/]+/p$", path):
+        return "part_metadata_bulk"
+    if re.search(r"/metadata/d/[^/]+/[wvm]/[^/]+/e/[^/]+/p/[^/]+$", path):
+        return "part_metadata_single"
+    if "/metadata/" in path:
+        return "element_metadata"
+    if re.search(r"/revisions/d/[^/]+$", path):
+        return "document_revisions"
+    if path.endswith("/latest") and query.get("et") == [str(ASSEMBLY_ELEMENT_TYPE)]:
+        return "assembly_revision"
+    if path.endswith("/latest") and query.get("et") == [str(DRAWING_ELEMENT_TYPE)]:
+        return "drawing_revision"
+    if re.search(r"/documents/d/[^/]+/[wvm]/[^/]+/elements$", path):
+        return "document_elements"
+    if re.search(r"/documents/[^/]+$", path):
+        return "document_metadata"
+    if "/translations" in path:
+        return "translation_status" if method == "GET" else "translation_create"
+    if "/externaldata/" in path:
+        return "translation_download"
+    return "other"
+
+
+def record_onshape_call(method: str, url: str) -> None:
+    ONSHAPE_CALL_COUNTS[onshape_call_category(method, url)] += 1
+
+
+def reset_onshape_call_counts() -> None:
+    ONSHAPE_CALL_COUNTS.clear()
+
+
+def onshape_call_summary() -> dict:
+    return {
+        "total": sum(ONSHAPE_CALL_COUNTS.values()),
+        "by_category": dict(sorted(ONSHAPE_CALL_COUNTS.items())),
+    }
+
+
 def onshape_get_json(url: str) -> dict:
+    record_onshape_call("GET", url)
     response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
     response.raise_for_status()
     payload = response.json()
@@ -294,6 +319,7 @@ def onshape_get_json(url: str) -> dict:
 
 def onshape_get_optional_json(url: str) -> dict | None:
     """Return an Onshape JSON object, or None for a successful 204 response."""
+    record_onshape_call("GET", url)
     response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
     response.raise_for_status()
     if response.status_code == 204:
@@ -304,16 +330,8 @@ def onshape_get_optional_json(url: str) -> dict | None:
     return payload
 
 
-def onshape_get_json_list(url: str) -> list:
-    response = requests.get(url, headers=onshape_headers("GET", url), timeout=60)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, list):
-        raise RuntimeError(f"Unexpected Onshape response from {url}: expected an array")
-    return payload
-
-
 def onshape_post_json(url: str, body: dict) -> dict:
+    record_onshape_call("POST", url)
     response = requests.post(
         url, headers=onshape_headers("POST", url), json=body, timeout=60
     )
@@ -325,6 +343,7 @@ def onshape_post_json(url: str, body: dict) -> dict:
 
 
 def onshape_download(url: str) -> bytes:
+    record_onshape_call("GET", url)
     headers = onshape_headers("GET", url)
     headers["Accept"] = "application/octet-stream"
     response = requests.get(url, headers=headers, timeout=120)
@@ -396,20 +415,6 @@ def fetch_latest_discovered_assembly_revision(
     )
     return onshape_get_optional_json(
         f"{endpoint}?{urlencode({'et': ASSEMBLY_ELEMENT_TYPE})}"
-    )
-
-
-def fetch_latest_drawing_revision(
-    reference: OnshapeDocumentReference, part_number: str
-) -> dict | None:
-    """Fetch the latest released drawing revision for a company-owned part number."""
-    encoded_part_number = quote(part_number, safe="")
-    endpoint = (
-        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/revisions/d/{reference.did}/"
-        f"p/{encoded_part_number}/latest"
-    )
-    return onshape_get_optional_json(
-        f"{endpoint}?{urlencode({'et': DRAWING_ELEMENT_TYPE})}"
     )
 
 
@@ -809,25 +814,11 @@ def source_document_reference(
     return OnshapeDocumentReference(base_url, did, wvm_type, wvm_id)
 
 
-def fetch_document_elements(reference: OnshapeDocumentReference) -> list[dict]:
+def fetch_document_revisions(base_url: str, document_id: str) -> dict:
+    """Fetch every released revision in one Onshape document."""
     endpoint = (
-        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/documents/d/"
-        f"{reference.did}/{reference.wvm_type}/{reference.wvm_id}/elements"
-    )
-    elements = onshape_get_json_list(endpoint)
-    if not all(isinstance(element, dict) for element in elements):
-        raise RuntimeError(
-            f"Unexpected Onshape elements response for document {reference.did}"
-        )
-    return elements
-
-
-def fetch_element_metadata(
-    reference: OnshapeDocumentReference, element_id: str
-) -> dict:
-    endpoint = (
-        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/metadata/d/"
-        f"{reference.did}/{reference.wvm_type}/{reference.wvm_id}/e/{element_id}"
+        f"{base_url.rstrip('/')}/api/{ONSHAPE_API_VERSION}/revisions/d/"
+        f"{quote(document_id, safe='')}"
     )
     return onshape_get_json(endpoint)
 
@@ -884,7 +875,7 @@ def discover_released_manufacturing_roots(
         if not latest or not str(latest.get("versionId") or "").strip():
             warnings.append(
                 f"Direct child {candidate_number} has no released assembly revision; "
-                "existing Baserow requirements were left unchanged"
+                "existing Supabase requirements were left unchanged"
             )
             continue
         released = released_assembly_from_revision(latest)
@@ -906,34 +897,15 @@ def discover_released_manufacturing_roots(
     return roots, sorted(set(warnings))
 
 
-def is_drawing_element(element: dict) -> bool:
-    element_type = str(
-        element.get("elementType") or element.get("type") or ""
-    ).strip().casefold()
-    if element_type == "drawing":
-        return True
-    structured_markers = (
-        element.get("mimeType"),
-        element.get("dataType"),
-        element.get("applicationType"),
-    )
-    if any(
-        "drawing" in str(marker or "").casefold() for marker in structured_markers
-    ):
-        return True
-    return (
-        element_type == "application" or element_type.isdigit()
-    ) and "drawing" in str(element.get("name") or "").casefold()
-
-
 def drawing_urls_for_parts(
     items: list[dict],
     prefixes: list[str],
     default_base_url: str,
     extra_references: list[OnshapeDocumentReference] | None = None,
+    revision_cache: dict[tuple[str, str], dict] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Find drawing tabs, then resolve each PDF source to its own latest release."""
-    expected_by_reference: dict[OnshapeDocumentReference, dict[str, str]] = {}
+    """Resolve released drawings with one revision request per source document."""
+    expected_by_document: dict[tuple[str, str], dict[str, str]] = {}
     all_expected: dict[str, str] = {}
     for row in items:
         part_number = str(row.get("partNumber") or "").strip()
@@ -945,54 +917,89 @@ def drawing_urls_for_parts(
         reference = source_document_reference(row.get("itemSource"), default_base_url)
         if reference is None:
             continue
-        expected_by_reference.setdefault(reference, {})[
+        document_key = (reference.base_url.rstrip("/"), reference.did)
+        expected_by_document.setdefault(document_key, {})[
             normalized_part_number(part_number)
         ] = part_number
 
-    for reference in set(extra_references or []):
-        expected_by_reference.setdefault(reference, {}).update(all_expected)
+    if not all_expected:
+        return {}, []
 
-    drawing_candidates: dict[str, set[OnshapeDocumentReference]] = {}
-    for reference, expected in expected_by_reference.items():
-        for element in fetch_document_elements(reference):
-            if not is_drawing_element(element):
+    for reference in set(extra_references or []):
+        document_key = (reference.base_url.rstrip("/"), reference.did)
+        expected_by_document.setdefault(document_key, {}).update(all_expected)
+
+    cache = revision_cache if revision_cache is not None else {}
+    drawing_candidates: dict[str, set[str]] = {}
+    for document_key, expected in expected_by_document.items():
+        if document_key not in cache:
+            cache[document_key] = fetch_document_revisions(*document_key)
+        payload = cache[document_key]
+        revision_items = next(
+            (
+                payload.get(key)
+                for key in ("items", "revisions", "results")
+                if isinstance(payload.get(key), list)
+            ),
+            None,
+        )
+        if revision_items is None:
+            raise RuntimeError(
+                f"Unexpected Onshape revisions response for document "
+                f"{document_key[1]}: no items array"
+            )
+
+        latest_by_part: dict[str, dict] = {}
+        for revision_item in revision_items:
+            if not isinstance(revision_item, dict):
                 continue
-            element_id = str(element.get("id") or element.get("elementId") or "").strip()
-            if not element_id:
+            element_type = str(revision_item.get("elementType") or "").casefold()
+            if element_type not in (str(DRAWING_ELEMENT_TYPE), "drawing"):
                 continue
-            candidate_keys = {
-                normalized_part_number(element.get("name")),
-                normalized_part_number(element.get("partNumber")),
-            }
-            if not any(candidate_key in expected for candidate_key in candidate_keys):
-                metadata = fetch_element_metadata(reference, element_id)
-                candidate_keys.add(
-                    normalized_part_number(metadata_property(metadata, "Part number"))
+            candidate_key = normalized_part_number(revision_item.get("partNumber"))
+            if candidate_key not in expected:
+                continue
+            current = latest_by_part.get(candidate_key)
+            sort_key = (
+                str(
+                    revision_item.get("releaseCreatedDate")
+                    or revision_item.get("createdAt")
+                    or ""
+                ),
+                str(revision_item.get("revision") or ""),
+                str(revision_item.get("versionId") or ""),
+                str(revision_item.get("elementId") or ""),
+            )
+            current_key = (
+                (
+                    str(
+                        current.get("releaseCreatedDate")
+                        or current.get("createdAt")
+                        or ""
+                    ),
+                    str(current.get("revision") or ""),
+                    str(current.get("versionId") or ""),
+                    str(current.get("elementId") or ""),
                 )
-            for candidate_key in candidate_keys - {""}:
-                part_number = expected.get(candidate_key)
-                if not part_number:
-                    continue
-                drawing_candidates.setdefault(part_number, set()).add(reference)
+                if current is not None
+                else None
+            )
+            if current_key is None or sort_key > current_key:
+                latest_by_part[candidate_key] = revision_item
+
+        reference = OnshapeDocumentReference(
+            document_key[0], document_key[1], "v", "unused"
+        )
+        for candidate_key, latest in latest_by_part.items():
+            part_number = expected[candidate_key]
+            drawing_candidates.setdefault(part_number, set()).add(
+                released_drawing_url(reference, part_number, latest)
+            )
 
     drawing_urls: dict[str, str] = {}
     warnings: list[str] = []
-    release_cache: dict[tuple[str, str, str], dict | None] = {}
-    for part_number in sorted(drawing_candidates):
-        urls: set[str] = set()
-        for reference in drawing_candidates[part_number]:
-            cache_key = (
-                reference.base_url,
-                reference.did,
-                normalized_part_number(part_number),
-            )
-            if cache_key not in release_cache:
-                release_cache[cache_key] = fetch_latest_drawing_revision(
-                    reference, part_number
-                )
-            latest = release_cache[cache_key]
-            if latest is not None:
-                urls.add(released_drawing_url(reference, part_number, latest))
+    for part_number in sorted(all_expected.values()):
+        urls = drawing_candidates.get(part_number, set())
         if len(urls) == 1:
             drawing_urls[part_number] = next(iter(urls))
         elif not urls:
@@ -1115,7 +1122,6 @@ def build_file_exports(
             FileExport(
                 part_number=part_number,
                 field_name=DRAWING_PDF_FIELD,
-                key_field_name=DRAWING_PDF_KEY_FIELD,
                 source_key=export_source_key("drawing", coordinates),
                 filename=f"{stem}.pdf",
                 content_type="application/pdf",
@@ -1167,7 +1173,6 @@ def build_file_exports(
                 FileExport(
                     part_number=part_number,
                     field_name=STEP_FILE_FIELD,
-                    key_field_name=STEP_KEY_FIELD,
                     source_key=source_key,
                     filename=f"{stem}.step",
                     content_type="application/step",
@@ -1217,7 +1222,7 @@ def row_property(row: dict, property_name: str):
 
 
 def operation_machine_name(value) -> str:
-    """Return the exact Baserow machine choice for an Onshape method value."""
+    """Return the exact Supabase machine choice for an Onshape method value."""
     machine = str(value or "").strip()
     normalized = normalized_property_name(machine)
     if normalized in ("", "none", "selectvalue"):
@@ -1226,7 +1231,7 @@ def operation_machine_name(value) -> str:
 
 
 def powder_coat_color(value) -> str:
-    """Return an exact Baserow choice for the released Onshape color."""
+    """Return an exact Supabase choice for the released Onshape color."""
     normalized = normalized_property_name(value)
     if normalized in ("", "none", "selectvalue"):
         return "None"
@@ -1258,6 +1263,35 @@ def fetch_part_metadata(item_source: dict, default_base_url: str) -> dict | None
     return onshape_get_json(f"{endpoint}?{urlencode(params)}")
 
 
+def fetch_parts_metadata(
+    reference: OnshapeDocumentReference,
+    element_id: str,
+    configuration: str,
+) -> dict:
+    """Read all part metadata for one immutable Part Studio configuration."""
+    endpoint = (
+        f"{reference.base_url}/api/{ONSHAPE_API_VERSION}/metadata/d/{reference.did}/"
+        f"{reference.wvm_type}/{reference.wvm_id}/e/{quote(element_id, safe='')}/p"
+    )
+    params = {
+        "includeComputedProperties": "true",
+        "includeComputedAssemblyProperties": "false",
+        "thumbnail": "false",
+    }
+    if configuration != "default":
+        params["configuration"] = configuration
+    return onshape_get_json(f"{endpoint}?{urlencode(params)}")
+
+
+def parts_metadata_items(payload: dict) -> list[dict]:
+    """Return the typed metadata entries from the bulk metadata response."""
+    for key in ("items", "parts", "objects", "results"):
+        items = payload.get(key)
+        if isinstance(items, list) and all(isinstance(item, dict) for item in items):
+            return items
+    raise RuntimeError("Unexpected Onshape bulk part metadata response: no items array")
+
+
 def operation_metadata_values(payload: dict) -> dict[str, object]:
     values = {}
     properties = payload.get("properties")
@@ -1273,13 +1307,19 @@ def operation_metadata_values(payload: dict) -> dict[str, object]:
 
 
 def hydrate_operation_properties(
-    items: list[dict], prefixes: list[str], default_base_url: str
+    items: list[dict],
+    prefixes: list[str],
+    default_base_url: str,
+    bulk_cache: dict[tuple, dict[str, dict]] | None = None,
+    single_cache: dict[tuple, dict | None] | None = None,
 ) -> list[dict]:
-    """Overlay released part metadata so operation properties need not be BOM columns."""
-    cache: dict[tuple, dict | None] = {}
-    hydrated = []
-    for original in items:
-        row = dict(original)
+    """Overlay routing metadata using one request per Part Studio/configuration."""
+    bulk_metadata_cache = bulk_cache if bulk_cache is not None else {}
+    fallback_cache = single_cache if single_cache is not None else {}
+    hydrated = [dict(original) for original in items]
+    rows_by_group: dict[tuple, list[tuple[dict, dict, str]]] = {}
+
+    for row in hydrated:
         part_number = str(row.get("partNumber") or "").strip()
         item_source = row.get("itemSource")
         if part_number and (
@@ -1290,27 +1330,49 @@ def hydrate_operation_properties(
             part_id = str(item_source.get("partId") or "").strip()
             _, configuration = source_url_and_configuration(item_source)
             if reference is not None and element_id and part_id:
-                cache_key = (
+                group_key = (
                     reference.base_url,
                     reference.did,
                     reference.wvm_type,
                     reference.wvm_id,
                     element_id,
-                    part_id,
                     configuration,
                 )
-                if cache_key not in cache:
-                    cache[cache_key] = fetch_part_metadata(
+                rows_by_group.setdefault(group_key, []).append(
+                    (row, item_source, part_id)
+                )
+
+    for group_key, group_rows in rows_by_group.items():
+        if group_key not in bulk_metadata_cache:
+            reference = OnshapeDocumentReference(
+                group_key[0], group_key[1], group_key[2], group_key[3]
+            )
+            payload = fetch_parts_metadata(
+                reference, group_key[4], group_key[5]
+            )
+            bulk_metadata_cache[group_key] = {
+                str(item.get("partId") or item.get("id") or ""): item
+                for item in parts_metadata_items(payload)
+                if str(item.get("partId") or item.get("id") or "").strip()
+            }
+        metadata_by_part = bulk_metadata_cache[group_key]
+
+        for row, item_source, part_id in group_rows:
+            metadata = metadata_by_part.get(part_id)
+            if metadata is None:
+                fallback_key = (*group_key, part_id)
+                if fallback_key not in fallback_cache:
+                    fallback_cache[fallback_key] = fetch_part_metadata(
                         item_source, default_base_url
                     )
-                metadata = cache[cache_key]
-                if metadata is not None:
-                    metadata_values = operation_metadata_values(metadata)
-                    for property_name in HYDRATED_PART_PROPERTY_NAMES:
-                        property_key = normalized_property_name(property_name)
-                        if property_key in metadata_values:
-                            row[property_name] = metadata_values[property_key]
-        hydrated.append(row)
+                metadata = fallback_cache[fallback_key]
+            if metadata is None:
+                continue
+            metadata_values = operation_metadata_values(metadata)
+            for property_name in HYDRATED_PART_PROPERTY_NAMES:
+                property_key = normalized_property_name(property_name)
+                if property_key in metadata_values:
+                    row[property_name] = metadata_values[property_key]
     return hydrated
 
 
@@ -1324,7 +1386,7 @@ def operation_machines_from_row(row: dict) -> tuple[tuple[str, str], ...]:
 
 
 def production_requirement_machine_fields(row: dict) -> dict:
-    """Return released routing values using exact Baserow choice names."""
+    """Return released routing values using exact Supabase choice names."""
     fields = {}
     for index, property_name in enumerate(OPERATION_PROPERTY_NAMES, start=1):
         machine = operation_machine_name(row_property(row, property_name))
@@ -1350,54 +1412,6 @@ def build_operation_records(requirements: list[dict]) -> list[dict]:
                 }
             )
     return operations
-
-
-def select_option_value(value) -> str:
-    """Return the displayed value from a Baserow single-select response."""
-    if isinstance(value, dict):
-        value = value.get("value")
-    return str(value or "").strip()
-
-
-def operation_sequence(operation: dict) -> int:
-    """Return the numeric position of an OP1 through OP4 operation."""
-    label = select_option_value(operation.get("Operation Number")).upper()
-    if label.startswith("OP") and label[2:].isdigit():
-        return int(label[2:])
-    return 999
-
-
-def operation_statuses_for_routes(
-    operations: list[dict], existing_rows: list[dict]
-) -> dict[str, str]:
-    """Gate each operation on completion of the preceding active route step.
-
-    Planned and Ready are sync-managed queue states. Manufacturing-owned states
-    are preserved, including In Progress, Blocked, Needs Rework, and Complete.
-    """
-    existing_by_key = {
-        str(row.get("Operation") or ""): row for row in existing_rows
-    }
-    routes: dict[str, list[dict]] = {}
-    for operation in operations:
-        production_key = str(operation.get("production_key") or "").strip()
-        routes.setdefault(production_key, []).append(operation)
-
-    statuses = {}
-    for route in routes.values():
-        predecessor_complete = True
-        for operation in sorted(route, key=operation_sequence):
-            operation_key = str(operation.get("Operation") or "")
-            current_status = select_option_value(
-                existing_by_key.get(operation_key, {}).get("Status")
-            )
-            if current_status in ("", "Planned", "Ready"):
-                status = "Ready" if predecessor_complete else "Planned"
-            else:
-                status = current_status
-            statuses[operation_key] = status
-            predecessor_complete = status == "Complete"
-    return statuses
 
 
 def build_records(
@@ -1434,7 +1448,7 @@ def build_records(
             "Manufacturing Method": str(row.get("manufacturingmethod") or "").strip(),
             "Vendor": str(row.get("vendor") or "").strip(),
             "Revision": str(row.get("revision") or "").strip(),
-            "OnShape Text": str(row.get("state") or "").strip(),
+            "OnShape Text": source_url,
             "Category": str(row.get("category") or "").strip(),
             "Active": True,
         }
@@ -1513,134 +1527,201 @@ def build_records(
     return list(parts.values()), list(requirements.values()), sorted(set(warnings))
 
 
-class BaserowClient:
-    def __init__(self, base_url: str, token: str):
+class SupabaseClient:
+    """Only public engineering RPCs and private Storage; no table REST access."""
+
+    def __init__(self, base_url: str, secret: str):
+        if not base_url.startswith("https://"):
+            raise ValueError("NEXT_PUBLIC_SUPABASE_URL must use HTTPS")
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"Token {token}"})
+        self.session.max_redirects = 0
+        self.session.headers.update({"apikey": secret})
+        # Supabase secret keys are not JWTs. Legacy service-role JWTs are supported.
+        if not secret.startswith("sb_secret_"):
+            self.session.headers["Authorization"] = f"Bearer {secret}"
 
-    def _url(self, table_id: int, suffix: str = "") -> str:
-        return f"{self.base_url}/database/rows/table/{table_id}/{suffix}?user_field_names=true"
+    @classmethod
+    def from_env(cls):
+        return cls(require_env("NEXT_PUBLIC_SUPABASE_URL"), require_env("SUPABASE_SECRET_KEY"))
 
-    def list_rows(self, table_id: int) -> list[dict]:
-        rows = []
-        page = 1
-        while True:
-            response = self.session.get(self._url(table_id), params={"user_field_names": "true", "page": page, "size": 200}, timeout=60)
-            response.raise_for_status()
-            payload = response.json()
-            rows.extend(payload.get("results", []))
-            if not payload.get("next"):
-                return rows
-            page += 1
-
-    def create_one(self, table_id: int, fields: dict) -> dict:
-        response = self.session.post(self._url(table_id), json=fields, timeout=60)
-        response.raise_for_status()
-        return response.json()
-
-    def update_one(self, table_id: int, row_id: int, fields: dict) -> dict:
-        response = self.session.patch(self._url(table_id, str(row_id) + "/"), json=fields, timeout=60)
-        response.raise_for_status()
-        return response.json()
-
-    @staticmethod
-    def _raise_batch_error_with_context(
-        response, table_id: int, operation: str, items: list[dict]
-    ) -> None:
-        try:
-            response.raise_for_status()
-        except Exception as exc:
-            try:
-                response_detail = response.json()
-            except Exception:
-                response_detail = str(getattr(response, "text", "") or "").strip()
-            identifying_fields = (
-                "id",
-                "Production Key",
-                "Part Number",
-                "Assembly Number",
-                "Operation",
-                "Operation Number",
-                "Machine",
-                "Machine OP1",
-                "Machine OP2",
-                "Machine OP3",
-                "Machine OP4",
-            )
-            item_identifiers = []
-            for batch_index, item in enumerate(items):
-                identifier = {"batch_index": batch_index}
-                for field in identifying_fields:
-                    value = item.get(field)
-                    if value not in (None, "", [], {}):
-                        identifier[field] = value
-                item_identifiers.append(identifier)
-            detail_text = json.dumps(
-                response_detail, sort_keys=True, default=str
-            )[:10000]
-            identifiers_text = json.dumps(
-                item_identifiers, sort_keys=True, default=str
-            )[:20000]
-            raise RuntimeError(
-                f"Baserow batch {operation} failed for table {table_id} "
-                f"with HTTP {getattr(response, 'status_code', 'unknown')}; "
-                f"response={detail_text}; "
-                f"batch_item_identifiers={identifiers_text}"
-            ) from exc
-
-    def batch_create(self, table_id: int, items: list[dict]) -> list[dict]:
-        created = []
-        for start in range(0, len(items), BATCH_SIZE):
-            batch = items[start:start+BATCH_SIZE]
-            response = self.session.post(
-                self._url(table_id, "batch/"),
-                json={"items": batch},
-                timeout=60,
-            )
-            self._raise_batch_error_with_context(
-                response, table_id, "create", batch
-            )
-            created.extend(response.json().get("items", []))
-        return created
-
-    def batch_update(self, table_id: int, items: list[dict]) -> list[dict]:
-        updated = []
-        for start in range(0, len(items), BATCH_SIZE):
-            batch = items[start:start+BATCH_SIZE]
-            response = self.session.patch(
-                self._url(table_id, "batch/"),
-                json={"items": batch},
-                timeout=60,
-            )
-            self._raise_batch_error_with_context(
-                response, table_id, "update", batch
-            )
-            updated.extend(response.json().get("items", []))
-        return updated
-
-    def upload_file(self, filename: str, content: bytes, content_type: str) -> dict:
+    def rpc(self, name: str, **params):
         response = self.session.post(
-            f"{self.base_url}/user-files/upload-file/",
-            files={"file": (filename, content, content_type)},
-            timeout=120,
+            f"{self.base_url}/rest/v1/rpc/{name}", json=params, timeout=120
         )
         response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict) or not payload.get("name"):
-            raise RuntimeError("Unexpected Baserow file upload response: no file name")
-        return payload
+        return response.json()
+
+    def begin_run(self) -> str:
+        run_id = str(uuid.uuid4())
+        self.rpc("manufacturing_begin_engineering_sync", p_run_id=run_id,
+                 p_run_url=os.environ.get("GITHUB_RUN_URL", ""))
+        return run_id
+
+    def finish_run(self, run_id: str, status: str, summary: dict):
+        return self.rpc("manufacturing_finish_engineering_sync", p_run_id=run_id,
+                        p_status=status, p_summary=summary)
+
+    def root_state(self) -> list[dict]:
+        return self.rpc("manufacturing_engineering_sync_state")
+
+    def attachment_state(self, part_numbers: list[str]) -> list[dict]:
+        return self.rpc("manufacturing_engineering_file_state", p_part_numbers=part_numbers)
+
+    def upload_file(self, filename: str, content: bytes, content_type: str) -> dict:
+        digest = hashlib.sha256(content).hexdigest()
+        extension = "pdf" if content_type == "application/pdf" else "step"
+        path = f"sha256/{digest[:2]}/{digest}.{extension}"
+        url = f"{self.base_url}/storage/v1/object/manufacturing-files/{path}"
+        response = self.session.post(url, data=content, headers={
+            "Content-Type": content_type, "x-upsert": "false"
+        }, timeout=120)
+        if response.status_code not in (200, 201):
+            # Only a genuine duplicate is acceptable. Verify its bytes as well.
+            try:
+                duplicate = str(response.json().get("error", "")) in ("Duplicate", "ResourceAlreadyExists")
+            except (ValueError, AttributeError):
+                duplicate = False
+            if not duplicate:
+                response.raise_for_status()
+                raise RuntimeError("Storage upload failed")
+        verified = self.session.get(url, timeout=120)
+        verified.raise_for_status()
+        if hashlib.sha256(verified.content).hexdigest() != digest:
+            raise RuntimeError("Storage verification failed")
+        return {"original_name": filename, "content_type": content_type,
+                "byte_size": len(content), "sha256": digest,
+                "storage_bucket": "manufacturing-files", "storage_path": path,
+                "verified_at": utc_now()}
 
 
-def all_root_revisions_are_current(
-    released_roots: list[ReleasedAssembly], discovery_master: str = ""
-) -> bool:
-    """Return whether Baserow already represents every resolved root revision."""
-    client = BaserowClient(
-        require_env("BASEROW_API_URL"), require_env("BASEROW_TOKEN")
-    )
-    assemblies_table_id = int(require_env("BASEROW_ASSEMBLIES_TABLE_ID"))
-    rows = client.list_rows(assemblies_table_id)
+# Display names are retained in dry-run records. This single boundary maps them
+# to the engineering columns in the authoritative manufacturing model.
+ENGINEERING_COLUMNS = {
+    "assemblies": {
+        "Assembly Number": "assembly_number", "Subsystem Name": "subsystem_name",
+        "Active": "active", "Sync Schema Version": "sync_schema_version",
+        "Latest Released Revision": "latest_released_revision",
+        "Master Baseline Revision": "master_baseline_revision",
+        "Integration Status": "integration_status", "Discovery Master": "discovery_master",
+        "Onshape Source": "onshape_url", "Last Synced At": "last_synced_at",
+    },
+    "parts": {
+        "Part Number": "part_number", "Name": "name", "Description": "description",
+        "Material": "material", "Manufacturing Method": "manufacturing_method",
+        "Vendor": "vendor", "Revision": "revision", "OnShape Text": "onshape_url",
+        "Category": "category", "Onshape Drawing": "drawing_url", "Active": "active",
+    },
+    "requirements": {
+        "Production Key": "production_key", "part_number": "part_number",
+        "assembly_number": "assembly_number", "Configuration": "configuration",
+        "Required Quantity": "required_quantity", "BOM Positions": "bom_positions",
+        "Onshape Source": "onshape_url", "Source Document": "source_document",
+        "Source Root": "source_root", "Source Assembly Revision": "source_assembly_revision",
+        "Required Part Revision": "required_part_revision", "Machine OP1": "machine_op1",
+        "Machine OP2": "machine_op2", "Machine OP3": "machine_op3", "Machine OP4": "machine_op4",
+        "Finishing": "finishing", "Active in BOM": "active_in_bom",
+    },
+    "operations": {
+        "Operation": "operation_key", "production_key": "production_key",
+        "Operation Number": "operation_number", "Machine": "machine",
+        "Active in Routing": "active_in_routing",
+    },
+}
+
+
+def engineering_rows(entity: str, rows: list[dict]) -> list[dict]:
+    return [{column: row[field] for field, column in ENGINEERING_COLUMNS[entity].items()
+             if field in row} for row in rows]
+
+
+def attach_exported_files(client, parts, existing_rows, exports_by_part, warnings):
+    """Stage complete file groups. Failed groups leave the catalog and keys intact."""
+    existing = {(row["part_number"], row["kind"]): row for row in existing_rows}
+    groups, cached = [], 0
+    for part in parts:
+        number = part["Part Number"]
+        for field, kind in ((DRAWING_PDF_FIELD, "drawing-pdf"), (STEP_FILE_FIELD, "step")):
+            exports = sorted((e for e in exports_by_part.get(number, []) if e.field_name == field),
+                             key=lambda e: e.source_key)
+            if not exports:
+                continue
+            key = aggregate_export_key(exports)
+            state = existing.get((number, kind), {})
+            if state.get("export_key") == key and state.get("file_count") == len(exports):
+                cached += 1
+                continue
+            try:
+                files = []
+                for export in exports:
+                    initial = start_file_translation(export)
+                    completed = wait_for_translation(export, initial)
+                    content = download_translation(export, completed)
+                    metadata = {**initial, **{k: v for k, v in completed.items() if v not in (None, "")}}
+                    uploaded = client.upload_file(completed_export_filename(export, metadata), content, export.content_type)
+                    # Stable per-part source identity fits the catalog's unique source_url.
+                    files.append({**uploaded,
+                        "source_url": export.endpoint + "?" + urlencode({"part_number": number, "export_key": export.source_key}),
+                        "source_metadata": {"export_key": export.source_key, "request": export.request_body},
+                    })
+                groups.append({"part_number": number, "kind": kind, "export_key": key, "files": files})
+            except Exception as exc:
+                warnings.append(f"Could not refresh {field} for {number}: {exc}")
+    return groups, cached
+
+
+def sync_to_supabase(parts, requirements, warnings, source_rows, exports_by_part,
+                     sync_cad_files, operations=None, assembly_records=None,
+                     synced_roots=None, discovery_master="", discovered_roots=None,
+                     discovery_complete=True, run_id=None):
+    client = SupabaseClient.from_env()
+    run_id = run_id or client.begin_run()
+    try:
+        assemblies = {r["assembly_number"]: {"Assembly Number": r["assembly_number"], "Active": True}
+                      for r in requirements if r.get("assembly_number")}
+        assemblies.update({a["Assembly Number"]: a for a in (assembly_records or [])})
+        groups, cached = [], 0
+        initial_warnings = len(warnings)
+        if sync_cad_files:
+            state = client.attachment_state([p["Part Number"] for p in parts])
+            groups, cached = attach_exported_files(client, parts, state, exports_by_part, warnings)
+        payload = {
+            "assemblies": engineering_rows("assemblies", list(assemblies.values())),
+            "parts": engineering_rows("parts", parts),
+            "requirements": engineering_rows("requirements", requirements),
+            "operations": [{**r, "work_type": "Manufacturing"}
+                           for r in engineering_rows("operations", operations or [])],
+            "finishing": [{"production_key": r["Production Key"], "color": r["Finishing"],
+                           "required_quantity": r["Required Quantity"], "active": True}
+                          for r in requirements if r.get("Finishing") in ("Red", "Black")],
+            "attachments": groups,
+            "synced_roots": sorted(synced_roots or []),
+            "discovered_roots": sorted(discovered_roots or synced_roots or []),
+            "discovery_master": discovery_master, "discovery_complete": discovery_complete,
+            # Retry incomplete exports on the next run without falsely marking CAD current.
+            "cad_synced": sync_cad_files and len(warnings) == initial_warnings,
+            "warnings": sorted(set(warnings)), "source_rows": source_rows,
+            "file_groups_cached": cached,
+        }
+        result = client.rpc("manufacturing_apply_engineering_sync", p_run_id=run_id, p_payload=payload)
+        if not isinstance(result, dict) or result.get("status") not in ("success", "partial", "failed"):
+            raise RuntimeError("Unexpected engineering sync RPC result")
+        if result.get("status") == "failed":
+            raise RuntimeError("Engineering transaction rolled back: " + result.get("error", "unknown error"))
+        return result
+    except Exception as exc:
+        try:
+            client.finish_run(run_id, "failed", {"error": str(exc)[:10000]})
+        except Exception as audit_error:
+            print(f"WARNING: Could not record sync failure: {audit_error}")
+        raise
+
+
+def stale_root_revisions(
+    released_roots: list[ReleasedAssembly], discovery_master: str = "", *, sync_cad_files: bool = False
+) -> tuple[set[str], bool]:
+    """Return stale normalized root numbers and discovery-membership status."""
+    rows = SupabaseClient.from_env().root_state()
     rows_by_number = {
         normalized_part_number(row.get("Assembly Number")): row
         for row in rows
@@ -1650,9 +1731,11 @@ def all_root_revisions_are_current(
     root_numbers = {
         normalized_part_number(released.part_number) for released in released_roots
     }
+    stale: set[str] = set()
     for released in released_roots:
         revision = str(released.revision or "").strip()
-        current = rows_by_number.get(normalized_part_number(released.part_number))
+        root_number = normalized_part_number(released.part_number)
+        current = rows_by_number.get(root_number)
         if (
             not revision
             or current is None
@@ -1660,9 +1743,11 @@ def all_root_revisions_are_current(
             != revision
             or str(current.get("Sync Schema Version") or "").strip()
             != SYNC_SCHEMA_VERSION
+            or (sync_cad_files and not current.get("CAD Synced"))
         ):
-            return False
+            stale.add(root_number)
 
+    membership_changed = False
     if discovery_master:
         previously_present = {
             normalized_part_number(row.get("Assembly Number"))
@@ -1672,25 +1757,14 @@ def all_root_revisions_are_current(
             != "Missing from Main — Review"
         }
         if previously_present != root_numbers:
-            return False
+            membership_changed = True
 
-    return True
+    return stale, membership_changed
 
 
 def aggregate_export_key(exports: list[FileExport]) -> str:
     encoded = "\n".join(sorted(export.source_key for export in exports)).encode()
     return hashlib.sha256(encoded).hexdigest()
-
-
-def existing_file_is_current(
-    row: dict, field_name: str, key_field_name: str, exports: list[FileExport]
-) -> bool:
-    files = row.get(field_name)
-    return (
-        str(row.get(key_field_name) or "") == aggregate_export_key(exports)
-        and isinstance(files, list)
-        and len(files) == len(exports)
-    )
 
 
 def start_file_translation(export: FileExport) -> dict:
@@ -1748,16 +1822,6 @@ def download_translation(export: FileExport, translation: dict) -> bytes:
     return content
 
 
-def baserow_file_references(value) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-    return [
-        {"name": str(item["name"])}
-        for item in value
-        if isinstance(item, dict) and item.get("name")
-    ]
-
-
 def completed_export_filename(export: FileExport, translation: dict) -> str:
     filename = str(
         translation.get("exportRuleFileName")
@@ -1773,553 +1837,6 @@ def completed_export_filename(export: FileExport, translation: dict) -> str:
     if not filename.casefold().endswith(extensions):
         filename += default_extension
     return filename
-
-
-def attach_exported_files(
-    client: BaserowClient,
-    parts: list[dict],
-    existing_rows: list[dict],
-    exports_by_part: dict[str, list[FileExport]],
-    warnings: list[str],
-) -> tuple[int, int]:
-    """Export changed CAD files and add Baserow file values to desired part rows."""
-    existing_by_part = {
-        str(row.get("Part Number") or ""): row for row in existing_rows
-    }
-    part_by_number = {part["Part Number"]: part for part in parts}
-    pending_groups: list[tuple[dict, list[FileExport]]] = []
-    cached_groups = 0
-
-    for part_number, part in part_by_number.items():
-        by_field: dict[str, list[FileExport]] = {}
-        for export in exports_by_part.get(part_number, []):
-            by_field.setdefault(export.field_name, []).append(export)
-        existing = existing_by_part.get(part_number, {})
-        for field_name, key_field_name in (
-            (DRAWING_PDF_FIELD, DRAWING_PDF_KEY_FIELD),
-            (STEP_FILE_FIELD, STEP_KEY_FIELD),
-        ):
-            group = by_field.get(field_name, [])
-            part[field_name] = baserow_file_references(existing.get(field_name))
-            part[key_field_name] = str(existing.get(key_field_name) or "")
-            if not group:
-                continue
-            elif existing_file_is_current(existing, field_name, key_field_name, group):
-                cached_groups += 1
-            else:
-                pending_groups.append((part, group))
-
-    started: list[tuple[dict, list[FileExport], list[tuple[FileExport, dict]]]] = []
-    for part, group in pending_groups:
-        translations: list[tuple[FileExport, dict]] = []
-        try:
-            for export in group:
-                translations.append((export, start_file_translation(export)))
-            started.append((part, group, translations))
-        except Exception as exc:
-            warnings.append(
-                f"Could not start {group[0].field_name} export for "
-                f"{group[0].part_number}: {exc}"
-            )
-
-    uploaded_groups = 0
-    for part, group, translations in started:
-        try:
-            attachments = []
-            for export, initial in translations:
-                completed = wait_for_translation(export, initial)
-                content = download_translation(export, completed)
-                filename_metadata = {
-                    **initial,
-                    **{
-                        key: value
-                        for key, value in completed.items()
-                        if value not in (None, "")
-                    },
-                }
-                uploaded = client.upload_file(
-                    completed_export_filename(export, filename_metadata),
-                    content,
-                    export.content_type,
-                )
-                attachments.append({"name": uploaded["name"]})
-            part[group[0].field_name] = attachments
-            part[group[0].key_field_name] = aggregate_export_key(group)
-            uploaded_groups += 1
-        except Exception as exc:
-            warnings.append(
-                f"Could not refresh {group[0].field_name} for "
-                f"{group[0].part_number}: {exc}"
-            )
-    return uploaded_groups, cached_groups
-
-
-def comparable(value):
-    if isinstance(value, list):
-        normalized = []
-        for item in value:
-            if isinstance(item, dict):
-                item = item.get("id", item.get("name", item))
-            normalized.append(json.dumps(item, sort_keys=True, default=str))
-        return sorted(normalized)
-    if isinstance(value, dict) and "value" in value:
-        return comparable(value.get("value"))
-    return value if value is not None else ""
-
-
-def changed(existing: dict, desired: dict, fields: tuple[str, ...]) -> bool:
-    return any(comparable(existing.get(field)) != comparable(desired.get(field)) for field in fields)
-
-
-def linked_row_ids(value) -> set[int]:
-    ids = set()
-    for item in value if isinstance(value, list) else []:
-        row_id = item.get("id") if isinstance(item, dict) else item
-        try:
-            ids.add(int(row_id))
-        except (TypeError, ValueError):
-            continue
-    return ids
-
-
-def upsert_table(
-    client: BaserowClient,
-    table_id: int,
-    key_field: str,
-    desired: list[dict],
-    update_fields: tuple[str, ...],
-    change_flag_field: str | None = None,
-):
-    existing = client.list_rows(table_id)
-    by_key = {str(row.get(key_field) or ""): row for row in existing}
-    creates, updates = [], []
-    for fields in desired:
-        current = by_key.get(str(fields[key_field]))
-        if current is None:
-            creates.append({**fields, **({change_flag_field: False} if change_flag_field else {})})
-        elif changed(current, fields, update_fields):
-            updates.append({"id": current["id"], **fields, **({change_flag_field: True} if change_flag_field else {})})
-    created = client.batch_create(table_id, creates) if creates else []
-    updated = client.batch_update(table_id, updates) if updates else []
-    return len(created), len(updated), len(desired) - len(creates) - len(updates)
-
-
-def sync_to_baserow(
-    parts: list[dict],
-    requirements: list[dict],
-    warnings: list[str],
-    source_rows: int,
-    exports_by_part: dict[str, list[FileExport]],
-    sync_cad_files: bool,
-    operations: list[dict] | None = None,
-    assembly_records: list[dict] | None = None,
-    synced_roots: set[str] | None = None,
-    discovery_master: str = "",
-) -> dict:
-    client = BaserowClient(require_env("BASEROW_API_URL"), require_env("BASEROW_TOKEN"))
-    table_ids = {
-        "sync": int(require_env("BASEROW_SYNC_RUNS_TABLE_ID")),
-        "parts": int(require_env("BASEROW_PARTS_TABLE_ID")),
-        "requirements": int(require_env("BASEROW_REQUIREMENTS_TABLE_ID")),
-        "operations": int(require_env("BASEROW_OPERATIONS_TABLE_ID")),
-        "assemblies": int(require_env("BASEROW_ASSEMBLIES_TABLE_ID")),
-        "finishing": int(require_env("BASEROW_FINISHING_TABLE_ID")),
-    }
-    started = utc_now()
-    run = client.create_one(table_ids["sync"], {"Started At": started, "Result": "Running", "Source Rows": source_rows})
-    try:
-        now = utc_now()
-        assembly_records = assembly_records or []
-        operations = operations or []
-        synced_roots = synced_roots or {
-            str(requirement.get("Source Root") or "")
-            for requirement in requirements
-            if requirement.get("Source Root")
-        }
-        assembly_numbers = {
-            str(requirement.get("assembly_number") or "")
-            for requirement in requirements
-            if requirement.get("assembly_number")
-        } | {
-            str(assembly.get("Assembly Number") or "")
-            for assembly in assembly_records
-            if assembly.get("Assembly Number")
-        }
-        assemblies = [
-            {"Assembly Number": number, "Active": True}
-            for number in sorted(assembly_numbers)
-        ]
-        assembly_fields = ("Assembly Number", "Active")
-        upsert_table(client, table_ids["assemblies"], "Assembly Number", assemblies, assembly_fields)
-        assembly_rows = client.list_rows(table_ids["assemblies"])
-        root_assembly_fields: tuple[str, ...] = ()
-        supported_assembly_records: list[dict] = []
-        if assembly_records:
-            available_assembly_fields = {
-                field for row in assembly_rows for field in row
-            }
-            candidate_assembly_fields = (
-                "Subsystem Name",
-                "Active",
-                "Latest Released Revision",
-                "Master Baseline Revision",
-                "Integration Status",
-                "Discovery Master",
-                "Onshape Source",
-                "Last Synced At",
-                "Sync Schema Version",
-            )
-            root_assembly_fields = tuple(
-                field
-                for field in candidate_assembly_fields
-                if field in available_assembly_fields
-            )
-            supported_assembly_records = [
-                {
-                    field: value
-                    for field, value in assembly.items()
-                    if field == "Assembly Number" or field in root_assembly_fields
-                }
-                for assembly in assembly_records
-            ]
-
-        missing_from_master = []
-        if discovery_master and assembly_rows:
-            available_assembly_fields = {
-                field for row in assembly_rows for field in row
-            }
-            if {
-                "Discovery Master",
-                "Integration Status",
-            }.issubset(available_assembly_fields):
-                missing_from_master = [
-                    {
-                        "id": row["id"],
-                        "Integration Status": "Missing from Main — Review",
-                    }
-                    for row in assembly_rows
-                    if str(row.get("Discovery Master") or "").strip()
-                    == discovery_master
-                    and str(row.get("Assembly Number") or "").strip()
-                    not in synced_roots
-                    and str(row.get("Integration Status") or "").strip()
-                    != "Missing from Main — Review"
-                ]
-                if missing_from_master:
-                    client.batch_update(
-                        table_ids["assemblies"], missing_from_master
-                    )
-        assembly_ids = {str(r.get("Assembly Number") or ""): r["id"] for r in assembly_rows}
-
-        part_rows = client.list_rows(table_ids["parts"])
-        files_uploaded = files_cached = 0
-        if sync_cad_files:
-            required_file_fields = (
-                DRAWING_PDF_FIELD,
-                DRAWING_PDF_KEY_FIELD,
-                STEP_FILE_FIELD,
-                STEP_KEY_FIELD,
-            )
-            missing_fields = [
-                field
-                for field in required_file_fields
-                if part_rows and not any(field in row for row in part_rows)
-            ]
-            if missing_fields:
-                raise RuntimeError(
-                    "Create the required fields on the Baserow Parts table before "
-                    "enabling CAD file sync: " + ", ".join(missing_fields)
-                )
-            files_uploaded, files_cached = attach_exported_files(
-                client, parts, part_rows, exports_by_part, warnings
-            )
-        for part in parts:
-            part["Last Synced At"] = now
-        part_fields = [
-            "Name",
-            "Description",
-            "Material",
-            "Manufacturing Method",
-            "Vendor",
-            "Revision",
-            "OnShape Text",
-            "Category",
-            "Onshape Drawing",
-            "Active",
-        ]
-        if sync_cad_files:
-            part_fields.extend(
-                (
-                    DRAWING_PDF_FIELD,
-                    DRAWING_PDF_KEY_FIELD,
-                    STEP_FILE_FIELD,
-                    STEP_KEY_FIELD,
-                )
-            )
-        upsert_table(
-            client, table_ids["parts"], "Part Number", parts, tuple(part_fields)
-        )
-        part_rows = client.list_rows(table_ids["parts"])
-        part_ids = {str(r.get("Part Number") or ""): r["id"] for r in part_rows}
-
-        existing_requirements = client.list_rows(table_ids["requirements"])
-        available_requirement_fields = {
-            field for row in existing_requirements for field in row
-        }
-        desired_requirements = []
-        for requirement in requirements:
-            fields = {
-                k: v
-                for k, v in requirement.items()
-                if k not in ("part_number", "assembly_number", "_operation_machines")
-            }
-            fields["Part"] = [part_ids[requirement["part_number"]]]
-            fields["Assembly"] = [assembly_ids[requirement["assembly_number"]]] if requirement["assembly_number"] else []
-            fields["Last Synced At"] = now
-            if available_requirement_fields:
-                fields = {
-                    field: value
-                    for field, value in fields.items()
-                    if field in available_requirement_fields
-                }
-            desired_requirements.append(fields)
-
-        source_fields = tuple(
-            field
-            for field in PRODUCTION_REQUIREMENT_MANAGED_FIELDS
-            if not available_requirement_fields
-            or field in available_requirement_fields
-        )
-        created, updated, unchanged = upsert_table(
-            client,
-            table_ids["requirements"],
-            "Production Key",
-            desired_requirements,
-            source_fields,
-            change_flag_field="Engineering Changed",
-        )
-
-        existing_requirements = client.list_rows(table_ids["requirements"])
-        desired_keys = {r["Production Key"] for r in desired_requirements}
-        desired_part_configurations = {
-            (
-                fields["Part"][0],
-                str(fields.get("Configuration") or "default"),
-            )
-            for fields in desired_requirements
-            if fields.get("Part")
-        }
-        deactivate = []
-        for row in existing_requirements:
-            row_source_root = str(row.get("Source Root") or "").strip()
-            linked = row.get("Assembly") or []
-            assembly_names = {str(x.get("value") or "") for x in linked if isinstance(x, dict)}
-            row_key = str(row.get("Production Key") or "")
-            if not row_source_root and row_key.count("|") >= 4:
-                row_source_root = row_key.split("|", 1)[0]
-            part_links = row.get("Part") or []
-            row_part_id = next(
-                (
-                    item.get("id")
-                    for item in part_links
-                    if isinstance(item, dict) and item.get("id") is not None
-                ),
-                None,
-            )
-            is_matching_legacy_row = (
-                not row_source_root
-                and not assembly_names
-                and row_key.startswith("|")
-                and (
-                    row_part_id,
-                    str(row.get("Configuration") or "default"),
-                )
-                in desired_part_configurations
-            )
-            is_synced_scope = row_source_root in synced_roots or (
-                not row_source_root and bool(assembly_names & synced_roots)
-            ) or is_matching_legacy_row
-            if (
-                is_synced_scope
-                and row.get("Production Key") not in desired_keys
-                and row.get("Active in BOM")
-            ):
-                deactivate.append({"id": row["id"], "Active in BOM": False, "Engineering Changed": True})
-        if deactivate:
-            client.batch_update(table_ids["requirements"], deactivate)
-
-        requirement_rows_by_key = {
-            str(row.get("Production Key") or ""): row
-            for row in client.list_rows(table_ids["requirements"])
-        }
-        synced_requirement_ids = {
-            int(row["id"])
-            for row in requirement_rows_by_key.values()
-            if str(row.get("Source Root") or "").strip() in synced_roots
-        }
-
-        desired_finishing = []
-        for requirement in requirements:
-            color = str(requirement.get("Finishing") or "None")
-            if color not in ("Red", "Black"):
-                continue
-            production_key = str(requirement.get("Production Key") or "")
-            requirement_row = requirement_rows_by_key.get(production_key)
-            if requirement_row is None:
-                raise RuntimeError(
-                    "No Baserow Production Requirement row found for finishing "
-                    f"queue item {production_key or '(unnamed)'}"
-                )
-            desired_finishing.append(
-                {
-                    "Production Key": production_key,
-                    "Production Requirement": [requirement_row["id"]],
-                    "Powder Coat Color": color,
-                    "Required Quantity": requirement["Required Quantity"],
-                    "Active": True,
-                    "Last Synced At": now,
-                }
-            )
-        # Machinist is assigned by manufacturing and must survive every resync.
-        # Finishing also has no claimed/completed quantity fields: each action
-        # represents the full Required Quantity for the Production Requirement.
-        finishing_fields = (
-            "Production Requirement",
-            "Powder Coat Color",
-            "Required Quantity",
-            "Active",
-            "Last Synced At",
-        )
-        (
-            finishing_created,
-            finishing_updated,
-            finishing_unchanged,
-        ) = upsert_table(
-            client,
-            table_ids["finishing"],
-            "Production Key",
-            desired_finishing,
-            finishing_fields,
-        )
-        desired_finishing_keys = {
-            row["Production Key"] for row in desired_finishing
-        }
-        deactivate_finishing = [
-            {"id": row["id"], "Active": False, "Last Synced At": now}
-            for row in client.list_rows(table_ids["finishing"])
-            if str(row.get("Production Key") or "") not in desired_finishing_keys
-            and row.get("Active") is not False
-            and bool(
-                linked_row_ids(row.get("Production Requirement"))
-                & synced_requirement_ids
-            )
-        ]
-        if deactivate_finishing:
-            client.batch_update(table_ids["finishing"], deactivate_finishing)
-
-        existing_operations = client.list_rows(table_ids["operations"])
-        operation_statuses = operation_statuses_for_routes(
-            operations, existing_operations
-        )
-        desired_operations = []
-        for operation in operations:
-            production_key = str(operation.get("production_key") or "")
-            requirement_row = requirement_rows_by_key.get(production_key)
-            if requirement_row is None:
-                raise RuntimeError(
-                    f"No Baserow Production Requirement row found for operation "
-                    f"{operation.get('Operation') or '(unnamed)'}"
-                )
-            desired_operations.append(
-                {
-                    key: value
-                    for key, value in {
-                        **operation,
-                        "Production Requirement": [requirement_row["id"]],
-                        "Status": operation_statuses[
-                            str(operation.get("Operation") or "")
-                        ],
-                    }.items()
-                    if key != "production_key"
-                }
-            )
-
-        operation_fields = (
-            "Production Requirement",
-            "Operation Number",
-            "Machine",
-            "Status",
-            "Active in Routing",
-        )
-        operations_created, operations_updated, operations_unchanged = upsert_table(
-            client,
-            table_ids["operations"],
-            "Operation",
-            desired_operations,
-            operation_fields,
-        )
-        desired_operation_keys = {
-            operation["Operation"] for operation in desired_operations
-        }
-        deactivate_operations = [
-            {"id": row["id"], "Active in Routing": False}
-            for row in client.list_rows(table_ids["operations"])
-            if row.get("Operation") not in desired_operation_keys
-            and row.get("Active in Routing") is not False
-            and bool(
-                linked_row_ids(row.get("Production Requirement"))
-                & synced_requirement_ids
-            )
-        ]
-        if deactivate_operations:
-            client.batch_update(table_ids["operations"], deactivate_operations)
-
-        # Record the root revision only after the dependent tables succeed. This
-        # value is the next run's early-exit marker, so writing it earlier could
-        # hide a partial failure and prevent a retry.
-        if root_assembly_fields:
-            upsert_table(
-                client,
-                table_ids["assemblies"],
-                "Assembly Number",
-                supported_assembly_records,
-                root_assembly_fields,
-            )
-
-        summary = {
-            "created": created,
-            "updated": updated,
-            "unchanged": unchanged,
-            "deactivated": len(deactivate),
-            "roots_missing_from_master": len(missing_from_master),
-            "file_groups_uploaded": files_uploaded,
-            "file_groups_cached": files_cached,
-            "operations_created": operations_created,
-            "operations_updated": operations_updated,
-            "operations_unchanged": operations_unchanged,
-            "operations_deactivated": len(deactivate_operations),
-            "finishing_created": finishing_created,
-            "finishing_updated": finishing_updated,
-            "finishing_unchanged": finishing_unchanged,
-            "finishing_deactivated": len(deactivate_finishing),
-        }
-        warnings = sorted(set(warnings))
-        client.update_one(table_ids["sync"], run["id"], {
-            "Finished At": utc_now(),
-            "Result": "Partial" if warnings else "Success",
-            "Requirements Created": created,
-            "Requirements Updated": updated,
-            "Requirements Unchanged": unchanged,
-            "Requirements Deactivated": len(deactivate),
-            "Warnings": "\n".join(warnings),
-            "GitHub Run URL": os.environ.get("GITHUB_RUN_URL", ""),
-        })
-        return summary
-    except Exception as exc:
-        try:
-            client.update_one(table_ids["sync"], run["id"], {"Finished At": utc_now(), "Result": "Failed", "Error": str(exc)[:10000]})
-        finally:
-            raise
 
 
 def environment_flag(name: str) -> bool:
@@ -2407,7 +1924,10 @@ def run_sync(
     sync_cad_files: bool = False,
     master_target: OnshapeTarget | None = None,
     discover_from_master: bool = False,
+    run_id: str | None = None,
 ) -> dict:
+    if output_json and not dry_run:
+        raise ValueError("--output-json is only available with --dry-run")
     targets = target if isinstance(target, list) else [target]
     if not targets:
         raise ValueError("At least one manufacturing-root assembly URL is required")
@@ -2422,6 +1942,10 @@ def run_sync(
     master_workspace_items: list[dict] = []
     root_sources: list[tuple[OnshapeDocumentReference, ReleasedAssembly]] = []
     document_metadata_cache: dict[str, dict | None] = {}
+    bulk_part_metadata_cache: dict[tuple, dict[str, dict]] = {}
+    single_part_metadata_cache: dict[tuple, dict | None] = {}
+    drawing_revision_cache: dict[tuple[str, str], dict] = {}
+    discovery_complete = True
 
     if discover_from_master:
         if len(targets) != 1:
@@ -2433,16 +1957,17 @@ def run_sync(
             )
         discovery_master_url = onshape_target_url(discovery_target)
         master_workspace_items = fetch_bom(
-            discovery_target, generate_if_absent=True
+            discovery_target, generate_if_absent=not dry_run
         )
         root_sources, discovery_warnings = discover_released_manufacturing_roots(
             discovery_target, master_workspace_items
         )
         warning_items.extend(discovery_warnings)
+        discovery_complete = not discovery_warnings
         if not root_sources:
             raise RuntimeError(
                 "No released direct-child manufacturing roots were discovered; "
-                "Baserow was not changed"
+                "Supabase was not changed"
             )
         master_target = None
     else:
@@ -2453,7 +1978,7 @@ def run_sync(
                 warning = (
                     "Manufacturing root "
                     f"{onshape_target_url(root_target)} could not be resolved and "
-                    "was skipped; existing Baserow requirements were left "
+                    "was skipped; existing Supabase requirements were left "
                     f"unchanged. {type(exc).__name__}: {exc}"
                 )
                 warning_items.append(warning)
@@ -2473,7 +1998,7 @@ def run_sync(
         if not root_sources:
             raise RuntimeError(
                 "No configured manufacturing roots could be resolved; "
-                "Baserow was not changed"
+                "Supabase was not changed"
             )
 
     resolved_root_numbers: set[str] = set()
@@ -2483,6 +2008,8 @@ def run_sync(
             raise RuntimeError(
                 "Released manufacturing-root assembly has no Part number"
             )
+        if not released.revision.strip():
+            raise RuntimeError(f"Manufacturing root {source_root} has no released revision")
         normalized_root = normalized_part_number(source_root)
         if normalized_root in resolved_root_numbers:
             raise ValueError(
@@ -2490,19 +2017,38 @@ def run_sync(
             )
         resolved_root_numbers.add(normalized_root)
 
-    if not dry_run and all_root_revisions_are_current(
-        [released for _, released in root_sources], discovery_master_url
-    ):
-        result = {
-            "skipped": True,
-            "reason": "All manufacturing-root revisions are already current",
-            "roots_checked": len(root_sources),
-            "source_revisions": [
-                released.as_dict() for _, released in root_sources
-            ],
-        }
-        print(json.dumps(result, indent=2))
-        return result
+    if not dry_run:
+        resolved_root_sources = list(root_sources)
+        stale_roots, membership_changed = stale_root_revisions(
+            [released for _, released in resolved_root_sources],
+            discovery_master_url,
+            sync_cad_files=sync_cad_files,
+        )
+        if not stale_roots and not membership_changed:
+            result = {
+                "skipped": True,
+                "reason": "All manufacturing-root revisions are already current",
+                "roots_checked": len(resolved_root_sources),
+                "warnings": sorted(set(warning_items)),
+                "source_revisions": [
+                    released.as_dict() for _, released in resolved_root_sources
+                ],
+            }
+            print(json.dumps(result, indent=2))
+            return result
+        root_sources = [source for source in resolved_root_sources
+                        if normalized_part_number(source[1].part_number) in stale_roots]
+        if not root_sources:
+            # Membership bookkeeping has no successful BOM scope and must never
+            # deactivate requirements or rescan unchanged drawings.
+            return sync_to_supabase(
+                [], [], warning_items, 0, {}, False, synced_roots=set(),
+                discovery_master=discovery_master_url,
+                discovered_roots={r.part_number for _, r in resolved_root_sources},
+                discovery_complete=discovery_complete, run_id=run_id,
+            )
+        print(f"Incremental sync: processing {len(root_sources)} changed root(s) "
+              f"of {len(resolved_root_sources)} resolved")
 
     for root_reference, released in root_sources:
         source_root = released.part_number.strip()
@@ -2512,50 +2058,64 @@ def run_sync(
             )
         seen_roots.add(source_root)
 
-        released_target = released.bom_target(root_reference.base_url)
-        raw_items = fetch_bom(released_target)
-        raw_items = hydrate_operation_properties(
-            raw_items, prefixes, root_reference.base_url
-        )
-        source_document_names, document_warnings = source_document_names_for_rows(
-            raw_items,
-            prefixes,
-            root_reference.base_url,
-            document_metadata_cache,
-        )
-        root_parts, root_requirements, root_warnings = build_records(
-            raw_items,
-            prefixes,
-            source_root=source_root,
-            source_revision=released.revision,
-            source_document_names=source_document_names,
-        )
-        drawing_urls, drawing_warnings = drawing_urls_for_parts(
-            raw_items,
-            prefixes,
-            root_reference.base_url,
-            [
-                OnshapeDocumentReference(
-                    released_target.base_url.rstrip("/"),
-                    released_target.did,
-                    released_target.wvm_type,
-                    released_target.wvm_id,
-                )
-            ],
-        )
-        for part in root_parts:
-            part["Onshape Drawing"] = drawing_urls.get(part["Part Number"], "")
-
-        root_exports: dict[str, list[FileExport]] = {}
-        export_warnings: list[str] = []
-        if sync_cad_files:
-            root_exports, export_warnings = build_file_exports(
-                root_parts,
+        try:
+            released_target = released.bom_target(root_reference.base_url)
+            raw_items = fetch_bom(released_target)
+            raw_items = hydrate_operation_properties(
                 raw_items,
-                drawing_urls,
                 prefixes,
                 root_reference.base_url,
+                bulk_part_metadata_cache,
+                single_part_metadata_cache,
             )
+            source_document_names, document_warnings = source_document_names_for_rows(
+                raw_items,
+                prefixes,
+                root_reference.base_url,
+                document_metadata_cache,
+            )
+            root_parts, root_requirements, root_warnings = build_records(
+                raw_items,
+                prefixes,
+                source_root=source_root,
+                source_revision=released.revision,
+                source_document_names=source_document_names,
+            )
+            drawing_urls, drawing_warnings = drawing_urls_for_parts(
+                raw_items,
+                prefixes,
+                root_reference.base_url,
+                [
+                    OnshapeDocumentReference(
+                        released_target.base_url.rstrip("/"),
+                        released_target.did,
+                        released_target.wvm_type,
+                        released_target.wvm_id,
+                    )
+                ],
+                drawing_revision_cache,
+            )
+            for part in root_parts:
+                part["Onshape Drawing"] = drawing_urls.get(part["Part Number"], "")
+
+            root_exports: dict[str, list[FileExport]] = {}
+            export_warnings: list[str] = []
+            if sync_cad_files:
+                root_exports, export_warnings = build_file_exports(
+                    root_parts,
+                    raw_items,
+                    drawing_urls,
+                    prefixes,
+                    root_reference.base_url,
+                )
+        except Exception as exc:
+            warning_items.append(
+                f"Manufacturing root {source_root} could not be synced and was skipped; "
+                f"existing Supabase requirements were left unchanged. {type(exc).__name__}: {exc}"
+            )
+            seen_roots.remove(source_root)
+            discovery_complete = False
+            continue
         root_results.append(
             {
                 "reference": root_reference,
@@ -2575,6 +2135,9 @@ def run_sync(
             + drawing_warnings
             + export_warnings
         )
+
+    if not root_results:
+        raise RuntimeError("No manufacturing roots could be synced; Supabase was not changed")
 
     master_released: ReleasedAssembly | None = None
     master_items: list[dict] = []
@@ -2691,7 +2254,7 @@ def run_sync(
             },
             "warnings": warnings,
         }
-        print("DRY RUN: no Baserow API calls were made")
+        print("DRY RUN: no Supabase API calls were made")
         if output_json:
             destination = Path(output_json)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2703,7 +2266,7 @@ def run_sync(
 
     if output_json:
         raise ValueError("--output-json is only available with --dry-run")
-    summary = sync_to_baserow(
+    summary = sync_to_supabase(
         parts,
         requirements,
         warnings,
@@ -2714,6 +2277,9 @@ def run_sync(
         assembly_records=assembly_records,
         synced_roots=seen_roots,
         discovery_master=discovery_master_url,
+        discovered_roots={released.part_number for _, released in resolved_root_sources} if not dry_run else seen_roots,
+        discovery_complete=discovery_complete,
+        run_id=run_id,
     )
     print(json.dumps(summary, indent=2))
     return summary
@@ -2725,7 +2291,7 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run",
         action="store_true",
         default=environment_flag("DRY_RUN"),
-        help="resolve the released BOM and build records without calling Baserow",
+        help="resolve the released BOM and build records without calling Supabase",
     )
     parser.add_argument(
         "--output-json",
@@ -2747,14 +2313,32 @@ def main(argv: list[str] | None = None) -> int:
         for p in os.environ.get("PARTNUMBER_PREFIXES", "").split(",")
         if p.strip()
     ]
-    run_sync(
-        sync_targets,
-        prefixes,
-        dry_run=args.dry_run,
-        output_json=args.output_json,
-        sync_cad_files=environment_flag("SYNC_CAD_FILES"),
-        discover_from_master=not use_subassembly_list,
-    )
+    if args.output_json and not args.dry_run:
+        parser.error("--output-json is only available with --dry-run")
+    reset_onshape_call_counts()
+    client = None if args.dry_run else SupabaseClient.from_env()
+    run_id = client.begin_run() if client else None
+    try:
+        result = run_sync(
+            sync_targets,
+            prefixes,
+            dry_run=args.dry_run,
+            output_json=args.output_json,
+            sync_cad_files=environment_flag("SYNC_CAD_FILES"),
+            discover_from_master=not use_subassembly_list,
+            run_id=run_id,
+        )
+        if client and result.get("skipped"):
+            client.finish_run(run_id, "partial" if result.get("warnings") else "success", result)
+    except Exception as exc:
+        if client:
+            try:
+                client.finish_run(run_id, "failed", {"error": str(exc)[:10000]})
+            except Exception as audit_error:
+                print(f"WARNING: Could not record sync failure: {audit_error}")
+        raise
+    finally:
+        print("Onshape API calls: " + json.dumps(onshape_call_summary(), sort_keys=True))
     return 0
 
 
