@@ -34,6 +34,7 @@ await db.exec(`
 const before=await query('select * from manufacturing.operations order by id');
 const allocations=await query('select * from manufacturing.operation_allocations order by operation_id');
 await db.exec(await read('../supabase/production/20260906_onshape_engineering_sync.sql'));
+await db.exec(await read('../supabase/production/20260906143815_preserve_cam_operations.sql'));
 assert.deepEqual(await query('select * from manufacturing.operations order by id'),before);
 const key='A-IMPORTED|A|A-IMPORTED|P-IMPORTED|default';
 const payload={

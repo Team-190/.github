@@ -1002,15 +1002,11 @@ def drawing_urls_for_parts(
         urls = drawing_candidates.get(part_number, set())
         if len(urls) == 1:
             drawing_urls[part_number] = next(iter(urls))
-        elif not urls:
-            warnings.append(
-                f"No released drawing revision found for {part_number}; "
-                "drawing link left blank"
-            )
-        else:
+        elif urls:
             warnings.append(
                 f"Multiple released drawings match {part_number}; drawing link left blank"
             )
+        # Drawings are optional; absence is normal and leaves the link blank.
     return drawing_urls, warnings
 
 

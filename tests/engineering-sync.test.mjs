@@ -20,6 +20,7 @@ await db.exec(`
 await db.exec(await read('./fixtures/contract-normalized.sql'));
 await db.exec(await read('./fixtures/contract-attachments.sql'));
 await db.exec(await read('../supabase/production/20260906_onshape_engineering_sync.sql'));
+await db.exec(await read('../supabase/production/20260906143815_preserve_cam_operations.sql'));
 
 const begin = async () => {
   const id = randomUUID();
@@ -158,9 +159,16 @@ assert.equal((await apply(membership)).status,'success');
 assert.equal((await snapshot()).assemblies.find(a=>a.assembly_number==='A-TWO').integration_status,'Discovered — Master Unreleased');
 
 // Empty released BOM legitimately deactivates the successful root's prior work.
+await sql(`insert into manufacturing.operations(operation_key,requirement_id,work_type,active_in_routing,claimed_quantity,completed_quantity)
+  select production_key||'|CAM|OP1',id,'CAM',true,2,1 from manufacturing.requirements where source_root='A-ONE'`);
+const camBefore = await sql("select * from manufacturing.operations where work_type='CAM' order by id");
+assert.ok(camBefore.length > 0);
 const empty=payload('A-ONE','C');
 for (const table of ['parts','requirements','operations','finishing']) empty[table]=[];
 assert.equal((await apply(empty)).status,'success');
+assert.deepEqual(await sql("select * from manufacturing.operations where work_type='CAM' order by id"),camBefore);
+assert.equal((await sql(`select count(*)::int n from manufacturing.operations o join manufacturing.requirements r on r.id=o.requirement_id
+  where r.source_root='A-ONE' and o.work_type='Manufacturing' and o.active_in_routing`))[0].n,0);
 assert.equal((await sql("select count(*)::int n from manufacturing.requirements where source_root='A-ONE' and active_in_bom"))[0].n,0);
 bad=structuredClone(empty);bad.synced_roots=[];
 assert.equal((await apply(bad)).status,'failed');

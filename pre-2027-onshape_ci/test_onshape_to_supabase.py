@@ -917,8 +917,7 @@ class DrawingLinkTests(unittest.TestCase):
             )
 
         self.assertNotIn(part_number, drawing_urls)
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("No released drawing revision", warnings[0])
+        self.assertEqual(warnings, [])
 
 
 class FileExportTests(unittest.TestCase):
