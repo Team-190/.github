@@ -32,6 +32,16 @@ file RPCs remain compatible with the authoritative application model.
 
 ## Configuration
 
+Apply `supabase/production/20260906143815_preserve_cam_operations.sql` after the
+initial engineering-sync migration. This correction is already applied to the
+manufacturing project: stale-operation deactivation only targets Manufacturing
+work, leaving shop-owned CAM routing intact. The 64 CAM rows incorrectly
+deactivated by the first run were restored with quantities and allocations preserved.
+
+Drawings are optional. A part without a released drawing keeps a blank drawing
+link and does not generate a warning or partial result. Ambiguous matches and
+API/export failures still produce warnings.
+
 Production GitHub Actions secrets:
 
 | Secret | Purpose |
