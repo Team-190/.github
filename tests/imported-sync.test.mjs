@@ -17,7 +17,7 @@ await db.exec(await read('./fixtures/contract-normalized.sql'));
 await db.exec(await read('./fixtures/contract-attachments.sql'));
 await db.exec(`
   insert into manufacturing.assemblies(assembly_number,sync_schema_version) values('A-IMPORTED','source-document-v1');
-  insert into manufacturing.parts(part_number,name,revision,step_export_key) values('P-IMPORTED','Plate','A','previous-export');
+  insert into manufacturing.parts(part_number,name,revision,step_export_key) values('P-IMPORTED','Plate','B','previous-export');
   insert into manufacturing.requirements(production_key,part_id,assembly_id,required_quantity,active_in_bom,status)
     select 'A-IMPORTED|A|A-IMPORTED|P-IMPORTED|default',p.id,a.id,4,true,'In Progress'
     from manufacturing.parts p cross join manufacturing.assemblies a;
@@ -30,18 +30,19 @@ await db.exec(`
     select id,1,'test-user-'||id,'Synthetic user',claimed_quantity,completed_quantity,'{}'
     from manufacturing.operations;
 `);
-// The migration must apply to duplicates already present, without rewriting them.
+// The migration must preserve duplicate rows while re-keying legacy identity in place.
 const before=await query('select * from manufacturing.operations order by id');
 const allocations=await query('select * from manufacturing.operation_allocations order by operation_id');
 await db.exec(await read('../supabase/production/20260906_onshape_engineering_sync.sql'));
 await db.exec(await read('../supabase/production/20260906143815_preserve_cam_operations.sql'));
+await db.exec(await read('../supabase/production/20260910_preserve_unchanged_part_revisions.sql'));
 assert.deepEqual(await query('select * from manufacturing.operations order by id'),before);
-const key='A-IMPORTED|A|A-IMPORTED|P-IMPORTED|default';
+const key='A-IMPORTED|B|A-IMPORTED|P-IMPORTED|default|v2';
 const payload={
-  assemblies:[{assembly_number:'A-IMPORTED',latest_released_revision:'A',sync_schema_version:'supabase-engineering-v1',active:true}],
-  parts:[{part_number:'P-IMPORTED',name:'Plate',revision:'A',active:true}],
+  assemblies:[{assembly_number:'A-IMPORTED',latest_released_revision:'B',sync_schema_version:'supabase-engineering-v2',active:true}],
+  parts:[{part_number:'P-IMPORTED',name:'Plate',revision:'B',active:true}],
   requirements:[{production_key:key,part_number:'P-IMPORTED',assembly_number:'A-IMPORTED',source_root:'A-IMPORTED',
-    source_assembly_revision:'A',required_part_revision:'A',configuration:'default',required_quantity:4,active_in_bom:true}],
+    source_assembly_revision:'B',required_part_revision:'B',configuration:'default',required_quantity:4,active_in_bom:true}],
   operations:[{operation_key:key+'|OP1',production_key:key,operation_number:'OP1',machine:'Haas CNC',work_type:'Manufacturing',active_in_routing:true}],
   finishing:[],attachments:[],warnings:[],synced_roots:['A-IMPORTED'],discovered_roots:['A-IMPORTED'],
   discovery_master:'',discovery_complete:true,cad_synced:false,source_rows:1,file_groups_cached:0,
@@ -66,8 +67,8 @@ for(let pass=0;pass<2;pass++) {
   assert.equal((await query('select step_export_key from manufacturing.parts'))[0].step_export_key,'previous-export');
 }
 const state=(await query('select public.manufacturing_engineering_sync_state() result'))[0].result;
-assert.equal(state[0]['Latest Released Revision'],'A');
-assert.equal(state[0]['Sync Schema Version'],'supabase-engineering-v1');
+assert.equal(state[0]['Latest Released Revision'],'B');
+assert.equal(state[0]['Sync Schema Version'],'supabase-engineering-v2');
 assert.equal(state[0]['CAD Synced'],false);
 
 // A key collision pointing at different shop work must roll the whole sync back.

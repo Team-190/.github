@@ -57,7 +57,7 @@ HYDRATED_PART_PROPERTY_NAMES = (
     *OPERATION_PROPERTY_NAMES,
     POWDER_COAT_PROPERTY_NAME,
 )
-SYNC_SCHEMA_VERSION = "supabase-engineering-v1"
+SYNC_SCHEMA_VERSION = "supabase-engineering-v2"
 ONSHAPE_CALL_COUNTS: Counter[str] = Counter()
 MACHINE_NAMES = (
     "Haas CNC",
@@ -174,6 +174,10 @@ class ReleasedAssembly:
             "is_obsolete": self.is_obsolete,
             "view_ref": self.view_ref,
         }
+
+
+class DuplicatePartNumberError(RuntimeError):
+    """A globally unique part number refers to different Onshape parts."""
 
 
 def require_env(name: str) -> str:
@@ -693,6 +697,34 @@ def item_source_document_id(value) -> str:
         urlparse(url).path,
     )
     return match.group(1) if match else ""
+
+
+def item_source_part_identity(value) -> tuple[str, str, str] | None:
+    """Return the revision-independent Onshape identity for one BOM part."""
+    if not isinstance(value, dict):
+        return None
+    document_id = item_source_document_id(value).casefold()
+    element_id = str(value.get("elementId") or "").strip().casefold()
+    part_id = str(value.get("partId") or "").strip()
+    if not document_id or not element_id or not part_id:
+        return None
+    return document_id, element_id, part_id
+
+
+def requirement_production_key(
+    source_root: str,
+    part_revision: str,
+    assembly_number: str,
+    part_number: str,
+    configuration: str,
+) -> str:
+    """Identify work by required part revision, not parent assembly revision."""
+    if source_root:
+        return (
+            f"{source_root}|{part_revision}|{assembly_number}|"
+            f"{part_number}|{configuration}|v2"
+        )
+    return f"{assembly_number}|{part_number}|{configuration}"
 
 
 def item_source_document_location(
@@ -1447,6 +1479,8 @@ def build_records(
             "OnShape Text": source_url,
             "Category": str(row.get("category") or "").strip(),
             "Active": True,
+            "_source_identity": item_source_part_identity(item_source),
+            "_source_root": source_root,
         }
         previous = parts.get(part_number)
         conflict_fields = (
@@ -1455,20 +1489,39 @@ def build_records(
             "Manufacturing Method",
             "Revision",
         )
-        if previous and any(
-            previous.get(field) != part.get(field) for field in conflict_fields
+        if previous and (
+            previous.get("_source_identity")
+            and part.get("_source_identity")
+            and previous["_source_identity"] != part["_source_identity"]
         ):
+            raise DuplicatePartNumberError(
+                f"Duplicate part number {part_number} refers to different Onshape "
+                "parts; correct the part number in Onshape before syncing"
+            )
+        if previous and any(
+            previous.get(field)
+            and part.get(field)
+            and previous.get(field) != part.get(field)
+            for field in conflict_fields
+        ):
+            if not previous.get("_source_identity") or not part.get("_source_identity"):
+                raise DuplicatePartNumberError(
+                    f"Duplicate part number {part_number} has conflicting engineering "
+                    "properties and no reliable Onshape identity; sync aborted"
+                )
             warnings.append(
                 f"Conflicting engineering properties or revisions for {part_number}"
             )
         elif previous is None:
             parts[part_number] = part
 
-        key = (
-            f"{source_root}|{source_revision}|{assembly_number}|"
-            f"{part_number}|{configuration}"
-            if source_root or source_revision
-            else f"{assembly_number}|{part_number}|{configuration}"
+        part_revision = str(row.get("revision") or "").strip()
+        key = requirement_production_key(
+            source_root,
+            part_revision,
+            assembly_number,
+            part_number,
+            configuration,
         )
         requirement = requirements.setdefault(
             key,
@@ -1478,7 +1531,7 @@ def build_records(
                 "assembly_number": assembly_number,
                 "Source Root": source_root,
                 "Source Assembly Revision": source_revision,
-                "Required Part Revision": str(row.get("revision") or "").strip(),
+                "Required Part Revision": part_revision,
                 "Configuration": configuration,
                 "Required Quantity": Decimal("0"),
                 "positions": [],
@@ -1865,6 +1918,22 @@ def merge_root_parts(
             if current is None:
                 merged[part_number] = dict(part)
                 continue
+            current_identity = current.get("_source_identity")
+            incoming_identity = part.get("_source_identity")
+            if current_identity and incoming_identity and current_identity != incoming_identity:
+                roots = sorted(
+                    root
+                    for root in {
+                        str(current.get("_source_root") or "").strip(),
+                        str(part.get("_source_root") or "").strip(),
+                    }
+                    if root
+                )
+                scope = f" across {', '.join(roots)}" if roots else ""
+                raise DuplicatePartNumberError(
+                    f"Duplicate part number {part_number}{scope} refers to different "
+                    "Onshape parts; correct the duplicate number before syncing"
+                )
             conflicts = [
                 field
                 for field in compared_fields
@@ -1873,6 +1942,12 @@ def merge_root_parts(
                 and current.get(field) != part.get(field)
             ]
             if conflicts:
+                if not current_identity or not incoming_identity:
+                    raise DuplicatePartNumberError(
+                        f"Duplicate part number {part_number} has conflicting values in "
+                        f"{', '.join(conflicts)} and cannot be matched to one Onshape part; "
+                        "sync aborted"
+                    )
                 warnings.append(
                     f"{part_number} differs across manufacturing roots in "
                     + ", ".join(conflicts)
@@ -1880,7 +1955,14 @@ def merge_root_parts(
             for field, value in part.items():
                 if not current.get(field) and value:
                     current[field] = value
-    return [merged[key] for key in sorted(merged)]
+    return [
+        {
+            field: value
+            for field, value in merged[key].items()
+            if not field.startswith("_source_")
+        }
+        for key in sorted(merged)
+    ]
 
 
 def merge_root_exports(
@@ -2104,6 +2186,11 @@ def run_sync(
                     prefixes,
                     root_reference.base_url,
                 )
+        except DuplicatePartNumberError:
+            # A duplicate number can otherwise merge unrelated CAD and shop work.
+            # Abort the entire run; never downgrade this integrity failure to a
+            # skipped-root warning and commit the remaining roots.
+            raise
         except Exception as exc:
             warning_items.append(
                 f"Manufacturing root {source_root} could not be synced and was skipped; "

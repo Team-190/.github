@@ -14,6 +14,10 @@ BOMs and drawing revisions. Engineering records and attachment catalogs are
 committed through one transactional RPC; shop workflow, assignments, QC,
 locations and production quantities remain shop-owned.
 
+Production requirement identity follows the required part revision rather than
+the parent assembly revision. Duplicate part numbers that resolve to different
+Onshape CAD identities abort the run before any database commit.
+
 See [Supabase setup and behavior](pre-2027-onshape_ci/SUPABASE_SETUP.md) for the
 unapplied migration, required secrets, ownership rules, failure handling and
 offline tests. No workflow applies database migrations.

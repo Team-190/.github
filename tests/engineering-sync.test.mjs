@@ -21,6 +21,7 @@ await db.exec(await read('./fixtures/contract-normalized.sql'));
 await db.exec(await read('./fixtures/contract-attachments.sql'));
 await db.exec(await read('../supabase/production/20260906_onshape_engineering_sync.sql'));
 await db.exec(await read('../supabase/production/20260906143815_preserve_cam_operations.sql'));
+await db.exec(await read('../supabase/production/20260910_preserve_unchanged_part_revisions.sql'));
 
 const begin = async () => {
   const id = randomUUID();
@@ -35,15 +36,15 @@ const snapshot = async () => {
     data[table] = await sql(`select * from manufacturing.${table} order by id`);
   return data;
 };
-function payload(root = 'A-ONE', revision = 'A') {
-  const key = `${root}|${revision}|${root}|P-ONE|default`;
+function payload(root = 'A-ONE', revision = 'A', partRevision = 'A') {
+  const key = `${root}|${partRevision}|${root}|P-ONE|default|v2`;
   return {
     assemblies: [{assembly_number:root,subsystem_name:'Subsystem',active:true,
-      sync_schema_version:'supabase-engineering-v1',latest_released_revision:revision,
+      sync_schema_version:'supabase-engineering-v2',latest_released_revision:revision,
       discovery_master:'https://example.test/master',integration_status:'Discovered — Master Unreleased'}],
-    parts: [{part_number:'P-ONE',name:'Plate',revision:'A',active:true}],
+    parts: [{part_number:'P-ONE',name:'Plate',revision:partRevision,active:true}],
     requirements: [{production_key:key,part_number:'P-ONE',assembly_number:root,
-      source_root:root,source_assembly_revision:revision,required_part_revision:'A',
+      source_root:root,source_assembly_revision:revision,required_part_revision:partRevision,
       configuration:'default',required_quantity:4,finishing:'Red',machine_op1:'Haas CNC',active_in_bom:true}],
     operations: [{operation_key:`${key}|OP1`,production_key:key,operation_number:'OP1',
       machine:'Haas CNC',work_type:'Manufacturing',active_in_routing:true}],
@@ -123,7 +124,8 @@ assert.equal((await apply(bad)).status,'failed');
 assert.deepEqual(await snapshot(),before);
 assert.equal((await sql("select status from manufacturing.engineering_sync_runs order by started_at desc limit 1"))[0].status,'failed');
 
-// Shared part across two roots: only the successfully synced root loses old rows.
+// A parent assembly revision change with the same required part revision keeps
+// the exact requirement/work rows and all shop-owned state.
 assert.equal((await apply(payload('A-TWO'))).status,'success');
 const secondRootBefore = (await snapshot());
 const next=payload('A-ONE','B');
@@ -132,15 +134,72 @@ next.discovery_complete=false;
 next.discovery_master='https://example.test/master';
 assert.equal((await apply(next)).status,'partial');
 const scoped=await snapshot();
-const oldRequirement=scoped.requirements.find(r=>r.production_key===first.requirements[0].production_key);
-assert.equal(oldRequirement.active_in_bom,false);
-assert.equal(scoped.operations.find(o=>o.requirement_id===oldRequirement.id).active_in_routing,false);
-assert.equal(scoped.finishing.find(f=>f.requirement_id===oldRequirement.id).active,false);
+const preservedRequirement=scoped.requirements.find(r=>r.production_key===first.requirements[0].production_key);
+const beforeRequirement=secondRootBefore.requirements.find(r=>r.production_key===first.requirements[0].production_key);
+assert.equal(preservedRequirement.id,beforeRequirement.id);
+assert.equal(preservedRequirement.active_in_bom,true);
+assert.equal(preservedRequirement.source_assembly_revision,'B');
+assert.equal(scoped.requirements.filter(r=>r.source_root==='A-ONE').length,1);
+assert.equal(scoped.operations.find(o=>o.requirement_id===preservedRequirement.id).id,
+  secondRootBefore.operations.find(o=>o.requirement_id===beforeRequirement.id).id);
+assert.equal(scoped.finishing.find(f=>f.requirement_id===preservedRequirement.id).id,
+  secondRootBefore.finishing.find(f=>f.requirement_id===beforeRequirement.id).id);
+for (const table of ['requirements','operations','finishing']) {
+  const fields=shopByTable[table];
+  const beforeRow=secondRootBefore[table].find(row =>
+    table==='requirements' ? row.id===beforeRequirement.id : row.requirement_id===beforeRequirement.id);
+  const afterRow=scoped[table].find(row =>
+    table==='requirements' ? row.id===preservedRequirement.id : row.requirement_id===preservedRequirement.id);
+  for (const name of fields.map(([name])=>name))
+    assert.deepEqual(afterRow[name],beforeRow[name],`${table}.${name} after parent revision`);
+}
 for (const table of ['requirements','operations','finishing']) {
   const other = secondRootBefore[table].at(-1);
   assert.deepEqual(scoped[table].find(r=>r.id===other.id),other);
 }
 assert.equal(scoped.assemblies.find(a=>a.assembly_number==='A-TWO').integration_status,'Discovered — Master Unreleased');
+
+// The first v2 run also re-keys a legacy parent-revision key in place when the
+// required part revision is unchanged.
+await db.exec(`
+  insert into manufacturing.assemblies(assembly_number,latest_released_revision,sync_schema_version)
+    values('A-LEGACY','A','supabase-engineering-v1');
+  insert into manufacturing.requirements(production_key,part_id,assembly_id,configuration,
+    required_quantity,source_root,source_assembly_revision,required_part_revision,active_in_bom,status)
+    select 'A-LEGACY|A|A-LEGACY|P-ONE|default',p.id,a.id,'default',4,
+      'A-LEGACY','A','B',true,'In Progress'
+    from manufacturing.parts p cross join manufacturing.assemblies a
+    where p.part_number='P-ONE' and a.assembly_number='A-LEGACY';
+  insert into manufacturing.operations(operation_key,requirement_id,operation_number,machine,
+    work_type,active_in_routing,status,claimed_quantity)
+    select production_key||'|OP1',id,'OP1','Haas CNC','Manufacturing',true,'In Progress',2
+    from manufacturing.requirements where source_root='A-LEGACY';
+  insert into manufacturing.finishing(production_key,requirement_id,color,required_quantity,active,machinist)
+    select production_key,id,'Red',4,true,'Legacy finisher'
+    from manufacturing.requirements where source_root='A-LEGACY';
+`);
+const legacyBefore=(await snapshot());
+const legacyRequirement=legacyBefore.requirements.find(r=>r.source_root==='A-LEGACY');
+assert.equal((await apply(payload('A-LEGACY','B','B'))).status,'success');
+const legacyAfter=await snapshot();
+const rekeyed=legacyAfter.requirements.find(r=>r.source_root==='A-LEGACY' && r.active_in_bom);
+assert.equal(rekeyed.id,legacyRequirement.id);
+assert.equal(rekeyed.production_key,'A-LEGACY|B|A-LEGACY|P-ONE|default|v2');
+assert.equal(rekeyed.status,'In Progress');
+assert.equal(Number(legacyAfter.operations.find(o=>o.requirement_id===rekeyed.id).claimed_quantity),2);
+assert.equal(legacyAfter.finishing.find(f=>f.requirement_id===rekeyed.id).machinist,'Legacy finisher');
+
+// An actual required part revision change intentionally creates a new work row
+// and retires the prior revision.
+const revisionA=payload('A-REVISION','A','A');
+assert.equal((await apply(revisionA)).status,'success');
+const revisionAId=(await snapshot()).requirements.find(r=>r.source_root==='A-REVISION').id;
+const revisionB=payload('A-REVISION','B','B');
+assert.equal((await apply(revisionB)).status,'success');
+const revisionRows=(await snapshot()).requirements.filter(r=>r.source_root==='A-REVISION');
+assert.equal(revisionRows.length,2);
+assert.equal(revisionRows.find(r=>r.id===revisionAId).active_in_bom,false);
+assert.notEqual(revisionRows.find(r=>r.active_in_bom).id,revisionAId);
 
 // Membership-only reconciliation never mutates work, even for a missing root.
 const membership=payload();

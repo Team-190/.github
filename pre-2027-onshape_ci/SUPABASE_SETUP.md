@@ -73,7 +73,20 @@ continues serving the independent Sheets scripts.
 
 The client submits business keys, never database IDs. The RPC resolves assemblies
 by `assembly_number`, parts by `part_number`, and dependent work by
-`production_key`. It upserts the explicit engineering allowlist from the model,
+`production_key`. Requirement keys include the required **part** revision, not
+the parent assembly revision. Releasing a parent assembly therefore updates an
+unchanged part requirement in place; its requirement, Manufacturing operation,
+finishing, allocation, and other shop-owned row identities survive. The v2
+migration safely re-keys one matching active legacy requirement on its first
+sync and rejects ambiguous matches. A changed required part revision still
+creates a new production row and retires the old revision.
+
+The client also verifies that each globally unique part number maps to one
+revision-independent Onshape document/element/part identity. A collision aborts
+the entire run before the Supabase RPC instead of warning and merging unrelated
+CAD metadata, files, routing, or shop work.
+
+The RPC upserts the explicit engineering allowlist from the model,
 including BOM-required quantities. It rejects shop fields and updates no shop
 status, assignment, QC, location, claimed/completed quantity, ledger, CAM notes,
 or allocation records. New rows leave shop columns at their schema defaults;

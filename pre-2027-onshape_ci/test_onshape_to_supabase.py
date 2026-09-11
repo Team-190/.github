@@ -1244,8 +1244,77 @@ class RecordBuildingTests(unittest.TestCase):
         self.assertEqual(requirement["Required Part Revision"], "C")
         self.assertEqual(
             requirement["Production Key"],
-            "A-190B-260001|B|A-190B-260001|P-190B-260100|default",
+            "A-190B-260001|C|A-190B-260001|P-190B-260100|default|v2",
         )
+
+    def test_parent_revision_does_not_change_requirement_identity(self):
+        rows = [
+            {
+                "item": "1",
+                "quantity": "2",
+                "partNumber": "P-190B-260100",
+                "name": "ROOT PLATE",
+                "revision": "C",
+                "itemSource": source("https://example/direct", 0),
+            }
+        ]
+        _, before, _ = MODULE.build_records(
+            rows,
+            ["P-190B-26"],
+            source_root="A-190B-260001",
+            source_revision="B",
+        )
+        _, after, _ = MODULE.build_records(
+            rows,
+            ["P-190B-26"],
+            source_root="A-190B-260001",
+            source_revision="D",
+        )
+
+        self.assertEqual(before[0]["Production Key"], after[0]["Production Key"])
+        self.assertEqual(after[0]["Source Assembly Revision"], "D")
+
+    def test_duplicate_part_number_for_different_cad_parts_aborts(self):
+        def identified_source(document_id, element_id, part_id):
+            return {
+                "viewHref": (
+                    f"https://cad.onshape.com/documents/{document_id}/v/"
+                    f"{'f' * 24}/e/{element_id}"
+                ),
+                "indentLevel": 1,
+                "documentId": document_id,
+                "elementId": element_id,
+                "partId": part_id,
+            }
+
+        rows = [
+            {
+                "item": "1",
+                "quantity": "1",
+                "partNumber": "P-190B-260726",
+                "name": "95T 5M 9mm Wide Belt",
+                "revision": "B",
+                "itemSource": identified_source("a" * 24, "b" * 24, "belt"),
+            },
+            {
+                "item": "2",
+                "quantity": "2",
+                "partNumber": "P-190B-260726",
+                "name": "Gear Spacer Intake Mechanism Middle",
+                "revision": "A",
+                "itemSource": identified_source("c" * 24, "d" * 24, "spacer"),
+            },
+        ]
+
+        with self.assertRaisesRegex(
+            MODULE.DuplicatePartNumberError, "Duplicate part number P-190B-260726"
+        ):
+            MODULE.build_records(
+                rows,
+                ["P-190B-26"],
+                source_root="A-190B-261131",
+                source_revision="B",
+            )
 
     def test_repeated_default_configuration_is_aggregated(self):
         rows = [
@@ -1283,6 +1352,69 @@ class RecordBuildingTests(unittest.TestCase):
 
 
 class MultiRootSyncTests(unittest.TestCase):
+    def test_duplicate_part_identity_across_roots_aborts_merge(self):
+        common = {
+            "Part Number": "P-190B-260726",
+            "Name": "same metadata would previously hide this collision",
+            "Revision": "A",
+            "Active": True,
+        }
+        belt = {
+            **common,
+            "_source_identity": ("a" * 24, "b" * 24, "belt"),
+            "_source_root": "A-190B-261131",
+        }
+        spacer = {
+            **common,
+            "_source_identity": ("c" * 24, "d" * 24, "spacer"),
+            "_source_root": "A-190B-261136",
+        }
+
+        with self.assertRaisesRegex(
+            MODULE.DuplicatePartNumberError,
+            "A-190B-261131, A-190B-261136",
+        ):
+            MODULE.merge_root_parts([[belt], [spacer]], [])
+
+    def test_cross_root_collision_never_reaches_supabase(self):
+        one = MODULE.released_assembly_from_revision(
+            revision("B", VID_B, partNumber="A-ONE")
+        )
+        two = replace(one, part_number="A-TWO")
+        belt = {
+            "Part Number": "P-190B-260726",
+            "Name": "95T 5M 9mm Wide Belt",
+            "Revision": "B",
+            "_source_identity": ("a" * 24, "b" * 24, "belt"),
+            "_source_root": "A-ONE",
+        }
+        spacer = {
+            "Part Number": "P-190B-260726",
+            "Name": "Gear Spacer Intake Mechanism Middle",
+            "Revision": "A",
+            "_source_identity": ("c" * 24, "d" * 24, "spacer"),
+            "_source_root": "A-TWO",
+        }
+        with patch.object(
+            MODULE, "resolve_latest_released_assembly", side_effect=[one, two]
+        ), patch.object(
+            MODULE, "stale_root_revisions", return_value=({"a-one", "a-two"}, False)
+        ), patch.object(
+            MODULE, "fetch_bom", return_value=[]
+        ), patch.object(
+            MODULE, "hydrate_operation_properties", return_value=[]
+        ), patch.object(
+            MODULE, "source_document_names_for_rows", return_value=({}, [])
+        ), patch.object(
+            MODULE, "build_records", side_effect=[([belt], [], []), ([spacer], [], [])]
+        ), patch.object(
+            MODULE, "drawing_urls_for_parts", return_value=({}, [])
+        ), patch.object(
+            MODULE, "sync_to_supabase", side_effect=AssertionError("Supabase called")
+        ):
+            with self.assertRaises(MODULE.DuplicatePartNumberError):
+                MODULE.run_sync([target(), replace(target(), did="1" * 24)], [])
+
     def test_unchanged_production_run_stops_before_fetching_root_bom(self):
         released = MODULE.released_assembly_from_revision(
             revision("B", VID_B, partNumber="A-ROOT-ONE")
@@ -1651,11 +1783,11 @@ class SupabaseSyncTests(unittest.TestCase):
     def test_payload_is_one_transaction_with_business_keys_and_no_shop_fields(self):
         client = Mock()
         client.rpc.return_value = {"status": "success"}
-        requirements = [{"Production Key": "ROOT|A|ROOT|P|default", "part_number": "P",
+        requirements = [{"Production Key": "ROOT|A|ROOT|P|default|v2", "part_number": "P",
             "assembly_number": "ROOT", "Source Root": "ROOT", "Finishing": "Red",
             "Required Quantity": 4, "Status": "DO NOT SEND", "Machinist": "DO NOT SEND",
             "QC Outcome": "DO NOT SEND", "location_id": 9}]
-        operations = [{"Operation": "ROOT|A|ROOT|P|default|OP1", "production_key": requirements[0]["Production Key"],
+        operations = [{"Operation": "ROOT|A|ROOT|P|default|v2|OP1", "production_key": requirements[0]["Production Key"],
             "Operation Number": "OP1", "Machine": "Haas CNC", "Active in Routing": True,
             "Status": "Ready", "Claimed Quantity": 6, "Completed Quantity": 2}]
         with patch.object(MODULE.SupabaseClient, "from_env", return_value=client):
