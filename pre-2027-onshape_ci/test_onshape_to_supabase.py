@@ -1059,6 +1059,7 @@ class RecordBuildingTests(unittest.TestCase):
                 {"name": "manufacturing method", "value": "HAAS CNC"},
                 {"name": "Manufacturing Method OP2", "value": "ShopSabre"},
                 {"name": "Powder Coat Color", "value": "Red"},
+                {"name": "QTY", "value": 2},
             ]
         }
 
@@ -1081,6 +1082,7 @@ class RecordBuildingTests(unittest.TestCase):
             (("OP1", "Haas CNC"), ("OP2", "Shop Sabre CNC")),
         )
         self.assertEqual(hydrated[0]["Powder Coat Color"], "Red")
+        self.assertEqual(hydrated[0]["QTY"], 2)
 
     def test_missing_bulk_part_uses_cached_single_part_fallback(self):
         item_source = {
@@ -1246,6 +1248,69 @@ class RecordBuildingTests(unittest.TestCase):
             requirement["Production Key"],
             "A-190B-260001|C|A-190B-260001|P-190B-260100|default|v2",
         )
+
+    def test_custom_qty_mismatch_warns_without_changing_required_quantity(self):
+        rows = [
+            {
+                "item": "102",
+                "quantity": "1",
+                "QTY": 2,
+                "partNumber": "P-190B-260826",
+                "name": "Shooter Side Spacer Plate",
+                "revision": "A",
+                "itemSource": source("https://example/direct", 0),
+            },
+            {
+                "item": "103",
+                "quantity": "3",
+                "QTY": "3.0",
+                "partNumber": "P-190B-260827",
+                "name": "MATCHING PLATE",
+                "revision": "A",
+                "itemSource": source("https://example/direct", 0),
+            },
+        ]
+
+        _, requirements, warnings = MODULE.build_records(
+            rows,
+            ["P-190B-26"],
+            source_root="A-190B-261131",
+            source_revision="B",
+        )
+
+        by_part = {item["part_number"]: item for item in requirements}
+        self.assertEqual(by_part["P-190B-260826"]["Required Quantity"], 1)
+        self.assertEqual(by_part["P-190B-260827"]["Required Quantity"], 3)
+        self.assertEqual(
+            warnings,
+            [
+                "BOM/custom QTY mismatch for P-190B-260826 in root "
+                "A-190B-261131 assembly A-190B-261131 at BOM position 102: "
+                "BOM quantity 1, custom QTY 2"
+            ],
+        )
+
+    def test_invalid_custom_qty_is_reported_without_failing_sync(self):
+        rows = [
+            {
+                "item": "5",
+                "quantity": "2",
+                "QTY": "two",
+                "partNumber": "P-190B-260100",
+                "name": "PLATE",
+                "itemSource": source("https://example/direct", 0),
+            }
+        ]
+
+        _, requirements, warnings = MODULE.build_records(
+            rows,
+            ["P-190B-26"],
+            source_root="A-190B-260001",
+        )
+
+        self.assertEqual(requirements[0]["Required Quantity"], 2)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Invalid custom QTY", warnings[0])
 
     def test_parent_revision_does_not_change_requirement_identity(self):
         rows = [

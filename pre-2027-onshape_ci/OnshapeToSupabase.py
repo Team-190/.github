@@ -53,9 +53,11 @@ OPERATION_PROPERTY_NAMES = (
     "Manufacturing Method OP4",
 )
 POWDER_COAT_PROPERTY_NAME = "Powder Coat Color"
+CUSTOM_QTY_PROPERTY_NAME = "QTY"
 HYDRATED_PART_PROPERTY_NAMES = (
     *OPERATION_PROPERTY_NAMES,
     POWDER_COAT_PROPERTY_NAME,
+    CUSTOM_QTY_PROPERTY_NAME,
 )
 SYNC_SCHEMA_VERSION = "supabase-engineering-v2"
 ONSHAPE_CALL_COUNTS: Counter[str] = Counter()
@@ -1232,6 +1234,40 @@ def decimal_quantity(value) -> Decimal:
         raise ValueError(f"Invalid BOM quantity: {value!r}") from exc
 
 
+def custom_qty_warning(
+    row: dict,
+    source_root: str,
+    assembly_number_value: str,
+    part_number: str,
+) -> str:
+    """Describe a released BOM/custom-QTY discrepancy without changing quantity."""
+    custom_value = row_property(row, CUSTOM_QTY_PROPERTY_NAME)
+    if custom_value is None or str(custom_value).strip() == "":
+        return ""
+
+    bom_value = row.get("quantity")
+    try:
+        bom_quantity = decimal_quantity(bom_value)
+        custom_quantity = decimal_quantity(custom_value)
+    except ValueError:
+        return (
+            f"Invalid custom QTY for {part_number} in root {source_root or '(unknown)'} "
+            f"assembly {assembly_number_value or '(unknown)'} at BOM position "
+            f"{str(row.get('item') or '').strip() or '(unknown)'}: "
+            f"BOM quantity {bom_value!r}, custom QTY {custom_value!r}"
+        )
+
+    if bom_quantity == custom_quantity:
+        return ""
+    return (
+        f"BOM/custom QTY mismatch for {part_number} in root "
+        f"{source_root or '(unknown)'} assembly {assembly_number_value or '(unknown)'} "
+        f"at BOM position {str(row.get('item') or '').strip() or '(unknown)'}: "
+        f"BOM quantity {number_value(bom_quantity)}, custom QTY "
+        f"{number_value(custom_quantity)}"
+    )
+
+
 def number_value(value: Decimal):
     return int(value) if value == value.to_integral_value() else float(value)
 
@@ -1460,6 +1496,11 @@ def build_records(
             continue
 
         assembly_number = str(row.get("assemblyNumber") or "").strip()
+        quantity_warning = custom_qty_warning(
+            row, source_root, assembly_number, part_number
+        )
+        if quantity_warning:
+            warnings.append(quantity_warning)
         item_source = row.get("itemSource")
         source_url, configuration = source_url_and_configuration(item_source)
         source_document_id = item_source_document_id(item_source)
