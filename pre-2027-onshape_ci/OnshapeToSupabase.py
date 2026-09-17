@@ -635,19 +635,26 @@ def is_assembly_row(row: dict) -> bool:
 def annotate_assemblies(
     items: list[dict], root_assembly_number: str = ""
 ) -> list[dict]:
-    """Assign each BOM row to its nearest assembly, falling back to the root."""
+    """Assign assembly identities and cumulative parent quantity multipliers."""
     output = []
-    stack: list[tuple[int, str]] = []
+    stack: list[tuple[int, str, Decimal]] = []
     for original in items:
         row = dict(original)
         level = indent_level(row)
         while stack and stack[-1][0] >= level:
             stack.pop()
-        if is_assembly_row(row):
-            stack.append((level, assembly_number(row)))
-        row["assemblyNumber"] = (
-            stack[-1][1] if stack else root_assembly_number
-        )
+        parent_assembly = stack[-1][1] if stack else root_assembly_number
+        parent_quantity = stack[-1][2] if stack else Decimal("1")
+        row["assemblyNumber"] = assembly_number(row) or parent_assembly
+        row["_parent_quantity"] = parent_quantity
+        # Track every row so unnamed subassemblies also scale their children.
+        # Missing quantities on synthetic assembly headers mean one instance.
+        quantity = row.get("quantity")
+        stack.append((
+            level,
+            row["assemblyNumber"],
+            parent_quantity * decimal_quantity(1 if quantity is None else quantity),
+        ))
         output.append(row)
     return output
 
@@ -1565,7 +1572,9 @@ def build_records(
             )
         elif not existing_machines and operation_machines:
             requirement["_operation_machines"] = operation_machines
-        requirement["Required Quantity"] += decimal_quantity(row.get("quantity"))
+        requirement["Required Quantity"] += (
+            decimal_quantity(row.get("quantity")) * row["_parent_quantity"]
+        )
         position = str(row.get("item") or "").strip()
         if position and position not in requirement["positions"]:
             requirement["positions"].append(position)
@@ -1998,6 +2007,7 @@ def run_sync(
     prefixes: list[str],
     *,
     dry_run: bool = False,
+    force_refresh: bool = False,
     output_json: str = "",
     sync_cad_files: bool = False,
     master_target: OnshapeTarget | None = None,
@@ -2102,6 +2112,8 @@ def run_sync(
             discovery_master_url,
             sync_cad_files=sync_cad_files,
         )
+        if force_refresh:
+            stale_roots = set(resolved_root_numbers)
         if not stale_roots and not membership_changed:
             result = {
                 "skipped": True,
@@ -2125,7 +2137,8 @@ def run_sync(
                 discovered_roots={r.part_number for _, r in resolved_root_sources},
                 discovery_complete=discovery_complete, run_id=run_id,
             )
-        print(f"Incremental sync: processing {len(root_sources)} changed root(s) "
+        print(f"{'Forced refresh' if force_refresh else 'Incremental sync'}: "
+              f"processing {len(root_sources)} root(s) "
               f"of {len(resolved_root_sources)} resolved")
 
     for root_reference, released in root_sources:
@@ -2377,6 +2390,12 @@ def main(argv: list[str] | None = None) -> int:
         help="resolve the released BOM and build records without calling Supabase",
     )
     parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        default=environment_flag("FORCE_REFRESH"),
+        help="rebuild all resolved roots even when their released revisions are unchanged",
+    )
+    parser.add_argument(
         "--output-json",
         default=os.environ.get("DRY_RUN_OUTPUT", "").strip(),
         metavar="PATH",
@@ -2406,6 +2425,7 @@ def main(argv: list[str] | None = None) -> int:
             sync_targets,
             prefixes,
             dry_run=args.dry_run,
+            force_refresh=args.force_refresh,
             output_json=args.output_json,
             sync_cad_files=environment_flag("SYNC_CAD_FILES"),
             discover_from_master=not use_subassembly_list,

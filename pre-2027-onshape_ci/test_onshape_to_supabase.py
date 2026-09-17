@@ -289,6 +289,17 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(run_sync.call_args.args[0].did, DID)
         self.assertTrue(run_sync.call_args.kwargs["discover_from_master"])
 
+    def test_main_passes_force_refresh_from_flag_or_environment(self):
+        for argv, env_flag in ((["--dry-run", "--force-refresh"], "false"),
+                               (["--dry-run"], "true")):
+            with self.subTest(argv=argv, env_flag=env_flag), patch.dict(
+                os.environ,
+                {"ONSHAPE_DOC_URL": f"https://cad.onshape.com/documents/{DID}/w/{WID}/e/{EID}",
+                 "FORCE_REFRESH": env_flag}, clear=True,
+            ), patch.object(MODULE, "run_sync") as run_sync:
+                MODULE.main(argv)
+                self.assertTrue(run_sync.call_args.kwargs["force_refresh"])
+
     def test_release_resolution_uses_part_number_and_returned_coordinates(self):
         metadata = {
             "properties": [
@@ -1008,6 +1019,38 @@ class FileExportTests(unittest.TestCase):
 
 
 class RecordBuildingTests(unittest.TestCase):
+    def test_subassembly_quantities_multiply_through_nested_bom(self):
+        rows = [
+            {"name": "A-190B-260003", "quantity": 3, "indentLevel": 0},
+            {"partNumber": "P-190B-260434", "quantity": 4, "indentLevel": 1},
+            {"name": "A-190B-260004", "quantity": 2, "indentLevel": 1},
+            {"partNumber": "P-190B-260435", "quantity": 5, "indentLevel": 2},
+            {"partNumber": "P-190B-260434", "quantity": 2, "indentLevel": 1},
+            {"partNumber": "P-190B-260436", "quantity": 7, "indentLevel": 0},
+        ]
+        _, requirements, _ = MODULE.build_records(rows, ["P-190B-26"])
+        quantities = {r["part_number"]: r["Required Quantity"] for r in requirements}
+        self.assertEqual(quantities, {
+            "P-190B-260434": 18,  # 3 * (4 + 2), after exiting nested assembly
+            "P-190B-260435": 30,  # 3 * 2 * 5
+            "P-190B-260436": 7,   # Outside all subassemblies
+        })
+        self.assertEqual(rows[1]["quantity"], 4)
+        self.assertNotIn("_parent_quantity", rows[1])
+
+    def test_unnamed_subassembly_quantity_and_missing_header_quantity(self):
+        for quantity, expected in ((3, 12), (0, 0), (None, 4)):
+            with self.subTest(quantity=quantity):
+                rows = [
+                    {"name": "Assembly", "quantity": quantity, "itemSource": source("", 0)},
+                    {"partNumber": "P-190B-260434", "quantity": 4, "itemSource": source("", 1)},
+                ]
+                _, requirements, _ = MODULE.build_records(
+                    rows, ["P-190B-26"], source_root="A-190B-260001"
+                )
+                self.assertEqual(requirements[0]["Required Quantity"], expected)
+                self.assertEqual(requirements[0]["assembly_number"], "A-190B-260001")
+
     def test_every_supabase_machine_name_is_normalized_case_insensitively(self):
         for machine in MODULE.MACHINE_NAMES:
             with self.subTest(machine=machine):
@@ -1434,6 +1477,37 @@ class MultiRootSyncTests(unittest.TestCase):
         self.assertTrue(result["skipped"])
         self.assertEqual(result["roots_checked"], 1)
         revision_gate.assert_called_once()
+
+    def test_force_refresh_rebuilds_unchanged_root_and_preserves_scope(self):
+        released = MODULE.released_assembly_from_revision(
+            revision("B", VID_B, partNumber="A-ROOT-ONE")
+        )
+        rows = [
+            {"name": "A-190B-260003", "quantity": 3, "indentLevel": 0},
+            {"partNumber": "P-190B-260434", "quantity": 4, "indentLevel": 1},
+        ]
+        with patch.object(
+            MODULE, "resolve_latest_released_assembly", return_value=released
+        ), patch.object(
+            MODULE, "stale_root_revisions", return_value=(set(), False)
+        ), patch.object(
+            MODULE, "fetch_bom", return_value=rows
+        ) as fetch_bom, patch.object(
+            MODULE, "hydrate_operation_properties", side_effect=lambda rows, *_: rows
+        ), patch.object(
+            MODULE, "source_document_names_for_rows", return_value=({}, [])
+        ), patch.object(
+            MODULE, "drawing_urls_for_parts", return_value=({}, [])
+        ), patch.object(
+            MODULE, "sync_to_supabase", return_value={"updated": 1}
+        ) as sync:
+            result = MODULE.run_sync([target()], ["P-190B-26"], force_refresh=True)
+
+        self.assertEqual(result, {"updated": 1})
+        fetch_bom.assert_called_once()
+        self.assertEqual(sync.call_args.args[1][0]["Required Quantity"], 12)
+        self.assertEqual(sync.call_args.kwargs["synced_roots"], {"A-ROOT-ONE"})
+        self.assertEqual(sync.call_args.kwargs["discovered_roots"], {"A-ROOT-ONE"})
 
     def test_production_run_fetches_only_stale_root(self):
         first_target = target()

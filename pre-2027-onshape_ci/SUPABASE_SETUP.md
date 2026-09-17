@@ -133,6 +133,14 @@ leave unreferenced private objects, but cannot leave a partial catalog or BOM.
 Future retries reuse content-addressed objects; cleanup is a separate operation.
 
 Unchanged released root revisions exit before BOM, metadata or drawing scans.
+For a quantity recalculation after a sync-code correction, pass `--force-refresh`
+or set `FORCE_REFRESH=true`. Both manual workflows expose `force_refresh`
+(default false). This rebuilds all resolved roots through the existing
+engineering RPC, preserving shop-owned work. Preview with a dry run first;
+dry runs already process every root. For a quantity refresh, disable CAD-file
+exports to avoid unnecessary translations. Part quantities are multiplied by
+every enclosing subassembly quantity in the indented BOM, including unnamed
+subassemblies; repeated part rows are then summed within their requirement.
 Roots with no released revision never reach drawing discovery. Changed roots
 share document-name, bulk part-metadata, fallback and document-revision caches.
 Empty matching BOMs issue no drawing requests. PDF and STEP export keys skip

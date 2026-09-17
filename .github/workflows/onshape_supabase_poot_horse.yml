@@ -12,6 +12,11 @@ on:
         description: Optional master Main URL when use_subassembly_list is false
         required: false
         type: string
+      force_refresh:
+        description: Recalculate all resolved roots even when released revisions are unchanged
+        required: false
+        default: false
+        type: boolean
       use_subassembly_list:
         description: Sync the configured manufacturing-root URL list instead of discovering from Main
         required: false
@@ -75,6 +80,7 @@ jobs:
 
       - name: Sync BOM to Supabase
         env:
+          FORCE_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_refresh }}
           ONSHAPE_ACCESS_KEY: ${{ secrets.ONSHAPE_ACCESS_KEY }}
           ONSHAPE_SECRET_KEY: ${{ secrets.ONSHAPE_SECRET_KEY }}
           ONSHAPE_DOC_URL: >-
