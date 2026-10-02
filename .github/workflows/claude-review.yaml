@@ -76,4 +76,4 @@ jobs:
             the github_review MCP server. Do not submit the review.
           claude_args: |
             --mcp-config ${{ runner.temp }}/mcp-config.json
-            --allowedTools "mcp__github_review__create_pending_pull_request_review,mcp__github_review__add_comment_to_pending_review,mcp__github_review__get_pull_request,mcp__github_review__list_pull_request_reviews"
+            --allowedTools "mcp__github_review__pull_request_read,mcp__github_review__pull_request_review_write"
