@@ -1,0 +1,77 @@
+name: Claude Draft Review
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      CLAUDE_REVIEWER_PAT:
+        required: true
+
+jobs:
+  draft-review:
+    name: Claude Draft Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Checkout shared review prompt
+        uses: actions/checkout@v4
+        with:
+          repository: Team-190/.github
+          sparse-checkout: |
+            claude-review-prompt.md
+          sparse-checkout-cone-mode: false
+          path: .team-190-github
+
+      - name: Read review prompt
+        id: prompt
+        run: |
+          {
+            echo 'content<<PROMPT_EOF'
+            cat .team-190-github/claude-review-prompt.md
+            echo 'PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # The GitHub MCP server's pending-review tools attribute reviews/comments to
+      # whichever token authenticates it, so this uses ElliotScher's own PAT
+      # (CLAUDE_REVIEWER_PAT) rather than the default GITHUB_TOKEN or the Claude
+      # GitHub App, so the pending review shows up under his account, not a bot's.
+      - name: Write GitHub MCP server config
+        env:
+          CLAUDE_REVIEWER_PAT: ${{ secrets.CLAUDE_REVIEWER_PAT }}
+        run: |
+          cat > "${RUNNER_TEMP}/mcp-config.json" <<EOF
+          {
+            "mcpServers": {
+              "github_review": {
+                "command": "docker",
+                "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"],
+                "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${CLAUDE_REVIEWER_PAT}" }
+              }
+            }
+          }
+          EOF
+
+      - name: Claude draft review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            ${{ steps.prompt.outputs.content }}
+
+            Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+            The PR branch is already checked out at HEAD with full history. Diff it against
+            origin/${{ github.event.pull_request.base.ref }} to see exactly what changed, then read
+            whatever surrounding file context you need to judge each change. Leave your findings as
+            pending review comments per the instructions above, authenticated as ElliotScher through
+            the github_review MCP server. Do not submit the review.
+          claude_args: |
+            --mcp-config ${{ runner.temp }}/mcp-config.json
+            --allowedTools "mcp__github_review__create_pending_pull_request_review,mcp__github_review__add_comment_to_pending_review,mcp__github_review__get_pull_request,mcp__github_review__list_pull_request_reviews"
