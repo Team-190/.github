@@ -1,4 +1,5 @@
 *.json
+!/branch-rulesets/**/*.json
 /.local-test/
 /.venv/
 node_modules/
