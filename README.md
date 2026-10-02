@@ -94,8 +94,15 @@ consumer repo can reference them without its own copy:
   the PR, instead of a review attributed to a bot he'd have to separately log
   in as to see.
 
-Known limitation: GitHub allows only one pending review per reviewer per PR.
-If ElliotScher already has an unsubmitted pending review on a PR from an
-earlier run, a second run that tries to create a new one instead of adding to
-the existing one will fail; the prompt asks Claude to check for and reuse an
-existing pending review first, but this isn't guaranteed.
+Claude talks to GitHub through [`review-guard`](https://github.com/eclipsesource/review-guard), a third-party MCP
+server (`npx @eclipsesource/review-guard-mcp`, pinned to `0.3.0` in the workflow), not GitHub's own official
+`github-mcp-server`. That one got tried first and turned out to have a real gap: its consolidated
+`pull_request_review_write` tool has no `comments` parameter at all, so it can only create a pending review with
+one plain-text body — no file/line-anchored comments or ```suggestion blocks, confirmed directly against its
+source. It's also one tool with a `method` argument for create *and* submit, so withholding just "submit" via
+`--allowedTools` (which only gates by tool name) isn't possible either. `review-guard` fixes both problems: its
+`add_review_comments` tool takes a real comments array, and — the reason it's used here — it has no `submit` tool
+registered at all unless the workflow explicitly passes `--allow-submit`, which it doesn't. Submitting, approving,
+or requesting changes is structurally unreachable, not just discouraged by the prompt, for as long as the workflow
+never passes that flag. It's also scoped to the one PR it's invoked for (`--repo`/`--pr`), so a run can't touch any
+other PR even if it wanted to.

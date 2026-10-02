@@ -40,21 +40,35 @@ jobs:
             echo 'PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      # The GitHub MCP server's pending-review tools attribute reviews/comments to
-      # whichever token authenticates it, so this uses ElliotScher's own PAT
-      # (CLAUDE_REVIEWER_PAT) rather than the default GITHUB_TOKEN or the Claude
-      # GitHub App, so the pending review shows up under his account, not a bot's.
-      - name: Write GitHub MCP server config
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # review-guard's pending-review tools attribute reviews/comments to whichever
+      # token authenticates it, so this uses ElliotScher's own PAT (CLAUDE_REVIEWER_PAT)
+      # rather than the default GITHUB_TOKEN or the Claude GitHub App, so the pending
+      # review shows up under his account, not a bot's.
+      #
+      # Deliberately not passing --allow-submit: without it, review-guard never
+      # registers a submit tool at all, so submitting/approving/requesting changes is
+      # structurally unreachable, not just discouraged by the prompt. Scoped to this
+      # one PR with --repo/--pr so a run can only ever touch the PR it was triggered for.
+      - name: Write review-guard MCP server config
         env:
           CLAUDE_REVIEWER_PAT: ${{ secrets.CLAUDE_REVIEWER_PAT }}
         run: |
           cat > "${RUNNER_TEMP}/mcp-config.json" <<EOF
           {
             "mcpServers": {
-              "github_review": {
-                "command": "docker",
-                "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"],
-                "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${CLAUDE_REVIEWER_PAT}" }
+              "review_guard": {
+                "command": "npx",
+                "args": [
+                  "-y", "@eclipsesource/review-guard-mcp@0.3.0", "--stdio",
+                  "--repo", "${{ github.repository }}",
+                  "--pr", "${{ github.event.pull_request.number }}"
+                ],
+                "env": { "GITHUB_TOKEN": "${CLAUDE_REVIEWER_PAT}" }
               }
             }
           }
@@ -73,7 +87,7 @@ jobs:
             origin/${{ github.event.pull_request.base.ref }} to see exactly what changed, then read
             whatever surrounding file context you need to judge each change. Leave your findings as
             pending review comments per the instructions above, authenticated as ElliotScher through
-            the github_review MCP server. Do not submit the review.
+            the review_guard MCP server.
           claude_args: |
             --mcp-config ${{ runner.temp }}/mcp-config.json
-            --allowedTools "mcp__github_review__pull_request_read,mcp__github_review__pull_request_review_write"
+            --allowedTools "mcp__review_guard__get_pr_review_context,mcp__review_guard__list_pending_review,mcp__review_guard__add_review_comments,mcp__review_guard__modify_review_comment,mcp__review_guard__delete_pending_review"
