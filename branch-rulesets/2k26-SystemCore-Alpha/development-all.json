@@ -1,1 +1,96 @@
-{"id":24345715,"name":"development-all","target":"branch","source_type":"Repository","source":"Team-190/2k26-SystemCore-Alpha","enforcement":"active","conditions":{"ref_name":{"exclude":[],"include":["refs/heads/development"]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"pull_request","parameters":{"required_approving_review_count":1,"dismiss_stale_reviews_on_push":true,"required_reviewers":[{"minimum_approvals":1,"file_patterns":["*"],"reviewer":{"id":18998306,"type":"Team"}}],"require_code_owner_review":false,"dismissal_restriction":{"enabled":false,"allowed_actors":[]},"require_last_push_approval":false,"required_review_thread_resolution":true,"require_extra_approval_for_unattributed_changes":true,"allowed_merge_methods":["merge","squash","rebase"]}},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"do_not_enforce_on_create":true,"required_status_checks":[{"context":"review / LCM Review Check","integration_id":15368},{"context":"Build","integration_id":15368},{"context":"Lint","integration_id":15368}]}}],"node_id":"RRS_lACqUmVwb3NpdG9yec5Ptx8lzgFzfHM","created_at":"2026-10-01T23:27:07.034-04:00","updated_at":"2026-10-01T23:27:07.154-04:00","bypass_actors":[{"actor_id":18998306,"actor_type":"Team","bypass_mode":"always"}],"current_user_can_bypass":"always","_links":{"self":{"href":"https://api.github.com/repos/Team-190/2k26-SystemCore-Alpha/rulesets/24345715"},"html":{"href":"https://github.com/Team-190/2k26-SystemCore-Alpha/rules/24345715"}}}
+{
+  "id": 24345715,
+  "name": "development-all",
+  "target": "branch",
+  "source_type": "Repository",
+  "source": "Team-190/2k26-SystemCore-Alpha",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": [
+        "refs/heads/development"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "required_reviewers": [
+          {
+            "minimum_approvals": 1,
+            "file_patterns": [
+              "*"
+            ],
+            "reviewer": {
+              "id": 18998306,
+              "type": "Team"
+            }
+          }
+        ],
+        "require_code_owner_review": false,
+        "dismissal_restriction": {
+          "enabled": false,
+          "allowed_actors": []
+        },
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": true,
+        "require_extra_approval_for_unattributed_changes": true,
+        "allowed_merge_methods": [
+          "merge",
+          "squash",
+          "rebase"
+        ]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": true,
+        "required_status_checks": [
+          {
+            "context": "review / LCM Review Check",
+            "integration_id": 15368
+          },
+          {
+            "context": "Build",
+            "integration_id": 15368
+          },
+          {
+            "context": "Lint",
+            "integration_id": 15368
+          }
+        ]
+      }
+    }
+  ],
+  "node_id": "RRS_lACqUmVwb3NpdG9yec5Ptx8lzgFzfHM",
+  "created_at": "2026-10-01T23:27:07.034-04:00",
+  "updated_at": "2026-10-01T23:27:07.154-04:00",
+  "bypass_actors": [
+    {
+      "actor_id": 18998306,
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    }
+  ],
+  "current_user_can_bypass": "always",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/Team-190/2k26-SystemCore-Alpha/rulesets/24345715"
+    },
+    "html": {
+      "href": "https://github.com/Team-190/2k26-SystemCore-Alpha/rules/24345715"
+    }
+  }
+}

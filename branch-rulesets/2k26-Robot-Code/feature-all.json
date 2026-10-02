@@ -1,1 +1,45 @@
-{"id":24345711,"name":"feature-all","target":"branch","source_type":"Repository","source":"Team-190/2k26-Robot-Code","enforcement":"active","conditions":{"ref_name":{"exclude":[],"include":["refs/heads/feature-*/**"]}},"rules":[{"type":"non_fast_forward"}],"node_id":"RRS_lACqUmVwb3NpdG9yec5CxQK2zgFzfG8","created_at":"2026-10-01T23:26:52.330-04:00","updated_at":"2026-10-01T23:26:52.369-04:00","bypass_actors":[{"actor_id":18998306,"actor_type":"Team","bypass_mode":"always"},{"actor_id":19381104,"actor_type":"Team","bypass_mode":"always"}],"current_user_can_bypass":"always","_links":{"self":{"href":"https://api.github.com/repos/Team-190/2k26-Robot-Code/rulesets/24345711"},"html":{"href":"https://github.com/Team-190/2k26-Robot-Code/rules/24345711"}}}
+{
+  "id": 24345711,
+  "name": "feature-all",
+  "target": "branch",
+  "source_type": "Repository",
+  "source": "Team-190/2k26-Robot-Code",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": [
+        "refs/heads/feature-*/**"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "non_fast_forward"
+    }
+  ],
+  "node_id": "RRS_lACqUmVwb3NpdG9yec5CxQK2zgFzfG8",
+  "created_at": "2026-10-01T23:26:52.330-04:00",
+  "updated_at": "2026-10-01T23:26:52.369-04:00",
+  "bypass_actors": [
+    {
+      "actor_id": 18998306,
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    },
+    {
+      "actor_id": 19381104,
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    }
+  ],
+  "current_user_can_bypass": "always",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/Team-190/2k26-Robot-Code/rulesets/24345711"
+    },
+    "html": {
+      "href": "https://github.com/Team-190/2k26-Robot-Code/rules/24345711"
+    }
+  }
+}

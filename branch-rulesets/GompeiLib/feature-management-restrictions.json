@@ -1,1 +1,48 @@
-{"id":24345685,"name":"feature-management-restrictions","target":"branch","source_type":"Repository","source":"Team-190/GompeiLib","enforcement":"active","conditions":{"ref_name":{"exclude":[],"include":["refs/heads/feature-*/main"]}},"rules":[{"type":"creation"},{"type":"deletion"}],"node_id":"RRS_lACqUmVwb3NpdG9yec4_KK2wzgFzfFU","created_at":"2026-10-01T23:25:48.459-04:00","updated_at":"2026-10-01T23:25:48.516-04:00","bypass_actors":[{"actor_id":18998306,"actor_type":"Team","bypass_mode":"always"},{"actor_id":19381104,"actor_type":"Team","bypass_mode":"always"}],"current_user_can_bypass":"always","_links":{"self":{"href":"https://api.github.com/repos/Team-190/GompeiLib/rulesets/24345685"},"html":{"href":"https://github.com/Team-190/GompeiLib/rules/24345685"}}}
+{
+  "id": 24345685,
+  "name": "feature-management-restrictions",
+  "target": "branch",
+  "source_type": "Repository",
+  "source": "Team-190/GompeiLib",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": [
+        "refs/heads/feature-*/main"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "creation"
+    },
+    {
+      "type": "deletion"
+    }
+  ],
+  "node_id": "RRS_lACqUmVwb3NpdG9yec4_KK2wzgFzfFU",
+  "created_at": "2026-10-01T23:25:48.459-04:00",
+  "updated_at": "2026-10-01T23:25:48.516-04:00",
+  "bypass_actors": [
+    {
+      "actor_id": 18998306,
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    },
+    {
+      "actor_id": 19381104,
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    }
+  ],
+  "current_user_can_bypass": "always",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/Team-190/GompeiLib/rulesets/24345685"
+    },
+    "html": {
+      "href": "https://github.com/Team-190/GompeiLib/rules/24345685"
+    }
+  }
+}

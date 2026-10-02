@@ -1,1 +1,48 @@
-{"id":23704485,"name":"feature-management-restrictions","target":"branch","source_type":"Repository","source":"Team-190/2k26-Robot-Code","enforcement":"active","conditions":{"ref_name":{"exclude":[],"include":["refs/heads/feature-*/main"]}},"rules":[{"type":"creation"},{"type":"deletion"}],"node_id":"RRS_lACqUmVwb3NpdG9yec5CxQK2zgFps6U","created_at":"2026-09-19T13:37:22.156-04:00","updated_at":"2026-09-19T13:37:22.213-04:00","bypass_actors":[{"actor_id":18998306,"actor_type":"Team","bypass_mode":"always"},{"actor_id":19381104,"actor_type":"Team","bypass_mode":"always"}],"current_user_can_bypass":"always","_links":{"self":{"href":"https://api.github.com/repos/Team-190/2k26-Robot-Code/rulesets/23704485"},"html":{"href":"https://github.com/Team-190/2k26-Robot-Code/rules/23704485"}}}
+{
+  "id": 23704485,
+  "name": "feature-management-restrictions",
+  "target": "branch",
+  "source_type": "Repository",
+  "source": "Team-190/2k26-Robot-Code",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": [
+        "refs/heads/feature-*/main"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "creation"
+    },
+    {
+      "type": "deletion"
+    }
+  ],
+  "node_id": "RRS_lACqUmVwb3NpdG9yec5CxQK2zgFps6U",
+  "created_at": "2026-09-19T13:37:22.156-04:00",
+  "updated_at": "2026-09-19T13:37:22.213-04:00",
+  "bypass_actors": [
+    {
+      "actor_id": 18998306,
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    },
+    {
+      "actor_id": 19381104,
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    }
+  ],
+  "current_user_can_bypass": "always",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/Team-190/2k26-Robot-Code/rulesets/23704485"
+    },
+    "html": {
+      "href": "https://github.com/Team-190/2k26-Robot-Code/rules/23704485"
+    }
+  }
+}
