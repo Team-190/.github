@@ -4,7 +4,7 @@ This is Team 190's org-wide `.github` repository. It provides:
 
 - **Org profile** — [`profile/README.md`](profile/README.md), shown on [github.com/Team-190](https://github.com/Team-190).
 - **Org-wide default templates** — [`PULL_REQUEST_TEMPLATE.md`](PULL_REQUEST_TEMPLATE.md) and [issue templates](.github/ISSUE_TEMPLATE), used automatically by repositories that do not define their own. See the [190 Software Knowledge Base](https://team-190.github.io/190-Software-Knowledge-Base/category/software-engineering-practices) for contributing and security practices.
-- **Shared CI** — Onshape → Supabase BOM sync and GompeiLib workflows under [`.github/workflows`](.github/workflows).
+- **Shared CI** — Onshape → Supabase BOM sync, GompeiLib sync, PR review automation, and Claude draft review workflows under [`.github/workflows`](.github/workflows).
 
 ## Onshape engineering BOM sync
 
@@ -54,3 +54,48 @@ runs require the migration and `NEXT_PUBLIC_SUPABASE_URL` and
 `bom_sync_poot_horse_supabase` and `bom_sync_delta_supabase`; external dispatchers
 must be updated separately. The archived workflow under
 `pre-2027-onshape-ci-workflows` remains archived.
+
+## PR review automation
+
+[`approvalautomation.yaml`](.github/workflows/approvalautomation.yaml) is a
+reusable (`workflow_call`) workflow, called by a thin per-repo wrapper the same
+way [`syncgompeilib.yaml`](.github/workflows/syncgompeilib.yaml) is. It
+auto-approves a PR, as the
+`190automationbot` account, whenever the **latest commit** on that PR is
+ElliotScher's — regardless of who originally opened the PR — and otherwise
+(re-)requests his review, including when a later commit on his own PR comes
+from someone else. It needs the existing `APPROVAL_PAT` secret, a token for the
+`190automationbot` account with permission to approve PRs and request
+reviewers, available org-wide already.
+
+## Claude draft review
+
+[`claude-review.yaml`](.github/workflows/claude-review.yaml) is a reusable
+workflow that runs Claude against the shared prompt in
+[`claude-review-prompt.md`](claude-review-prompt.md) whenever ElliotScher is
+requested as a PR reviewer. It leaves its findings as a **pending** GitHub
+review — comments only he can see until he opens the PR and submits (or
+discards) them himself — rather than an automatically-submitted review.
+
+That requires two secrets, added as org-level Actions secrets so every
+consumer repo can reference them without its own copy:
+
+- `CLAUDE_CODE_OAUTH_TOKEN` — generated locally with `claude setup-token` against
+  ElliotScher's Claude Pro subscription. Runs against his subscription usage
+  instead of metered API billing, by his choice — the tradeoff is that
+  automated review runs share his personal usage limits with his own
+  interactive Claude Code sessions, rather than drawing from a separate billed
+  pool the way an `ANTHROPIC_API_KEY` would.
+- `CLAUDE_REVIEWER_PAT` — a personal access token on **ElliotScher's own**
+  GitHub account (classic PAT with `repo` scope, or a fine-grained token with
+  pull request read/write), not the automation bot's. GitHub only shows a
+  pending review to whoever's token created it, so this has to be his token
+  for the draft comments to actually appear as a draft review when he opens
+  the PR, instead of a review attributed to a bot he'd have to separately log
+  in as to see.
+
+Known limitation: GitHub allows only one pending review per reviewer per PR.
+If ElliotScher already has an unsubmitted pending review on a PR from an
+earlier run, a second run that tries to create a new one instead of adding to
+the existing one will fail; the prompt asks Claude to check for and reuse an
+existing pending review first, but this isn't guaranteed.
