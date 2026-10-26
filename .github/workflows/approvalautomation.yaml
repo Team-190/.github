@@ -22,14 +22,12 @@ jobs:
             const prUpdatedAt = new Date(pr.updated_at);
 
             // Get all commits on this PR and find who made the latest one
-            const { data: commits } = await github.rest.pulls.listCommits({
+            const { data: headCommit } = await github.rest.repos.getCommit({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: prNumber
+              ref: pr.head.sha
             });
-
-            const latestCommit = commits[commits.length - 1];
-            const lastCommitAuthor = latestCommit?.author?.login;
+            const lastCommitAuthor = headCommit?.author?.login;
 
             // Get all reviews
             const { data: reviews } = await github.rest.pulls.listReviews({
@@ -80,13 +78,15 @@ jobs:
                 console.log("No approval needed at this time");
               }
 
-            } else {
+             } else {
               // Request review from ElliotScher since the latest commit isn't his
               const alreadyRequested = pr.requested_reviewers
                 .map(r => r.login)
                 .includes('ElliotScher');
 
-              if (!alreadyRequested) {
+              if (prAuthor === 'ElliotScher') {
+                console.log("PR authored by ElliotScher; cannot request review from author");
+              } else if (!alreadyRequested) {
                 console.log("Requesting review from ElliotScher");
                 await github.rest.pulls.requestReviewers({
                   owner: context.repo.owner,
