@@ -48,7 +48,10 @@ jobs:
             const latestBotReview = botReviews[0];
             const latestHumanReview = humanReviews[0];
 
-            if (lastCommitAuthor === 'ElliotScher') {
+            // Only auto-approve PRs that ElliotScher opened AND whose latest commit is his.
+            // A PR opened by someone else always needs a real review, even if
+            // ElliotScher pushed the most recent commit to it.
+            if (prAuthor === 'ElliotScher' && lastCommitAuthor === 'ElliotScher') {
               // Auto-approve logic
               let needsApproval = false;
 
@@ -67,7 +70,7 @@ jobs:
               }
 
               if (needsApproval && pr.draft === false) {
-                console.log("Auto-approving PR last committed to by ElliotScher");
+                console.log("Auto-approving PR opened and last committed to by ElliotScher");
                 await github.rest.pulls.createReview({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -78,8 +81,8 @@ jobs:
                 console.log("No approval needed at this time");
               }
 
-             } else {
-              // Request review from ElliotScher since the latest commit isn't his
+            } else {
+              // Request review from ElliotScher since the PR or its latest commit isn't his
               const alreadyRequested = pr.requested_reviewers
                 .map(r => r.login)
                 .includes('ElliotScher');
